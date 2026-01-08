@@ -32,7 +32,7 @@ use std::process::Command;
 /// do it well, know what's going to happen before you run it.
 
 #[derive(Serialize, Deserialize, Debug)]
-struct SymlinkHistory {
+struct History {
     created_at: String,
     backup: String,
     files: Vec<String>,
@@ -50,7 +50,7 @@ struct State {
     active_profile: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    symlink_history: Option<Vec<SymlinkHistory>>,
+    history: Option<Vec<History>>,
 }
 
 impl State {
@@ -72,6 +72,11 @@ impl State {
 
     fn set_active_profile(mut self, profile: &str) -> Self {
         self.active_profile = Some(profile.to_owned());
+        self
+    }
+
+    fn append_history(mut self, history: History) -> Self {
+        self.history.get_or_insert_with(Vec::new).push(history);
         self
     }
 
@@ -144,17 +149,17 @@ enum Commands {
 
     Status {},
     Refresh {},
-    // Validate?
-    /// general rust doubt.
-    /// how does it interpret the capitlized word as a proper command?
     Backup {},
-
     Destroy {},
 }
 
 fn expand_home(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~") {
-        PathBuf::from(format!("{}{}", std::env::var("HOME").unwrap_or_else(|_| ".".to_string()), rest))
+        PathBuf::from(format!(
+            "{}{}",
+            std::env::var("HOME").unwrap_or_else(|_| ".".to_string()),
+            rest
+        ))
     } else {
         PathBuf::from(path)
     }
@@ -234,7 +239,7 @@ fn init(config_path: Option<std::path::PathBuf>) {
     _ = config.write_state_file();
 }
 
-fn create_symlinks(files: &Vec<String>, source_dir: &String) -> Result<(), String> {
+fn create_symlinks(files: &Vec<String>, source_dir: &String) -> Result<String, String> {
     let mut source_path = PathBuf::from(source_dir);
     if source_dir.ends_with('/') {
         source_path = PathBuf::from(source_dir.trim_end_matches('/'))
@@ -244,7 +249,9 @@ fn create_symlinks(files: &Vec<String>, source_dir: &String) -> Result<(), Strin
         let target = PathBuf::from(file);
         let source = source_path.join(&target);
 
-        if let Some(parent) = target.parent()  && !parent.exists() {
+        if let Some(parent) = target.parent()
+            && !parent.exists()
+        {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("failed to create directory {:?}: {}", parent, e))?;
         }
@@ -258,10 +265,10 @@ fn create_symlinks(files: &Vec<String>, source_dir: &String) -> Result<(), Strin
 
         info!("created symlink: {:?} -> {:?}", target, source);
     }
-    Ok(())
+    Ok(chrono::Local::now().format("%Y-%m-%d--%H-%M-%S").to_string())
 }
 
-fn create_backup(files: &Vec<String>, target_dir: &str) -> Result<(), String> {
+fn create_backup(files: &Vec<String>, target_dir: &str) -> Result<PathBuf, String> {
     let backup_path = expand_home(target_dir);
 
     fs::create_dir_all(&backup_path)
@@ -299,37 +306,35 @@ fn create_backup(files: &Vec<String>, target_dir: &str) -> Result<(), String> {
     }
     zip.finish()
         .map_err(|e| format!("failed to finalize zip: {}", e))?;
-    Ok(())
+
+    info!("backup created at {:?}", backup_path);
+    Ok(zip_path)
 }
 
-fn setup(profile: String) {
-    let state = match State::new() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("failed to read state: {}", e);
-            return;
-        }
-    };
-
-    let state = state.set_active_profile(&profile);
+fn setup(profile: String) -> Result<(), String> {
+    let mut state = State::new().map_err(|e| format!("failed to read state: {}", e))?;
+    state = state.set_active_profile(&profile);
     info!("profile set to {}", profile);
 
     let profile_files = state.profiles.get(&profile).or_else(|| {
         info!("profile {} not found! trying 'default' profile", profile);
         state.profiles.get("default")
-    });
+    }).ok_or("no 'default' profile found!")?;
 
-    match profile_files {
-        Some(files) => {
-            if let Err(e) = create_backup(files, &state.backup_path) {
-                eprintln!("{}", e);
-            }
-            if let Err(e) = create_symlinks(files, &state.path) {
-                eprintln!("{}", e);
-            }
-        }
-        None => eprintln!("no 'default' profile found!"),
-    }
+    let backup_dir = create_backup(profile_files, &state.backup_path)?;
+    info!("backup completed at {:?}", backup_dir);
+
+    let created_at = create_symlinks(profile_files, &state.path)?;
+
+    let history = History {
+        created_at,
+        backup: backup_dir.display().to_string(),
+        files: profile_files.clone(),
+    };
+    state = state.append_history(history);
+    state.write_state_file().map_err(|e| format!("failed to write state file: {}", e))?;
+    
+    Ok(())
 }
 
 fn main() {
@@ -339,19 +344,14 @@ fn main() {
 
     match cli.command {
         Commands::Init { config } => init(config),
-        Commands::Setup { profile, dry_run } => {
-            setup(profile);
-            info!("setup command");
+        Commands::Setup { profile, .. } => {
+            if let Err(e) = setup(profile) {
+                eprintln!("setup failed: {}", e);
+            }
         }
         Commands::Status {} => {}
         Commands::Refresh {} => {}
-        Commands::Backup {} => {
-            info!("Backup command");
-            debug!("Backup path: {:?}", "somepath");
-        }
-        Commands::Destroy {} => {
-            info!("Destroy command");
-            debug!("Force: {}", "done");
-        }
+        Commands::Backup {} => info!("Backup command"),
+        Commands::Destroy {} => info!("Destroy command"),
     }
 }

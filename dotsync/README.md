@@ -67,7 +67,7 @@ The tool keeps one source of truth: a readonly state file that tracks your confi
     "path": "~/.dotfiles",
     "backup_path": "~/.dotfiles/backup/",
     "active_profile": "default",
-    "symlink_history": [
+    "history": [
         {
             "created_at": "2024-01-06T10:35:00Z",
             "backup": "~/.dotfiles/backup/dotfiles_backup_2024-01-06.zip",

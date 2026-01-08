@@ -23,15 +23,8 @@ RUN microdnf update -y && \
     ca-certificates && \
     microdnf clean all
 
-RUN useradd -m -s /bin/bash appuser
-
-WORKDIR /home/appuser
+WORKDIR /root
 
 COPY --from=builder /build/target/aarch64-unknown-linux-musl/release/dotsync /usr/local/bin/dotsync
 
-COPY .dotsync.json ./.dotsync.json
-
-RUN chown -R appuser:appuser /home/appuser && \
-    chmod 755 /usr/local/bin/dotsync
-
-USER appuser
+COPY .dotsync.json /root/.dotsync.json

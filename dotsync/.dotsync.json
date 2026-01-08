@@ -1,0 +1,32 @@
+{
+    "url": "https://github.com/neelabalan/dotfiles",
+    "branch": "master",
+    "path": "~/.dotfiles",
+    "backup_path": "~/.dotfiles/backup/",
+    "profiles": {
+        "default": [
+            ".bashrc",
+            ".bash_profile",
+            ".tmux.conf",
+            ".haskeline",
+            ".ruff.toml",
+            ".vimrc",
+            ".visidatarc",
+            ".ipython",
+            ".config/starship.toml",
+            ".config/nvim",
+            ".config/.ghc",
+            ".config/kitty",
+            ".config/mpv",
+            ".config/ranger"
+        ],
+        "container": [
+            ".bashrc",
+            ".bash_profile",
+            ".config/starship.toml",
+            ".config/nvim",
+            ".tmux.conf"
+        ]
+    }
+
+}
