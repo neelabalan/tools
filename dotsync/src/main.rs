@@ -70,8 +70,8 @@ impl State {
         Ok(state)
     }
 
-    fn set_active_profile(mut self, profile: &String) -> Self {
-        self.active_profile = Some(profile.clone());
+    fn set_active_profile(mut self, profile: &str) -> Self {
+        self.active_profile = Some(profile.to_owned());
         self
     }
 
@@ -153,10 +153,8 @@ enum Commands {
 }
 
 fn expand_home(path: &str) -> PathBuf {
-    if path.starts_with("~") {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let rest = &path[1..];
-        PathBuf::from(format!("{}{}", home, rest))
+    if let Some(rest) = path.strip_prefix("~") {
+        PathBuf::from(format!("{}{}", std::env::var("HOME").unwrap_or_else(|_| ".".to_string()), rest))
     } else {
         PathBuf::from(path)
     }
@@ -246,11 +244,9 @@ fn create_symlinks(files: &Vec<String>, source_dir: &String) -> Result<(), Strin
         let target = PathBuf::from(file);
         let source = source_path.join(&target);
 
-        if let Some(parent) = target.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("failed to create directory {:?}: {}", parent, e))?;
-            }
+        if let Some(parent) = target.parent()  && !parent.exists() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create directory {:?}: {}", parent, e))?;
         }
 
         std::os::unix::fs::symlink(&source, &target).map_err(|e| {
