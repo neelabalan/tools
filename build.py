@@ -8,6 +8,10 @@ import sys
 import tarfile
 
 
+class CommandError(Exception):
+    pass
+
+
 @dataclasses.dataclass(frozen=True)
 class BuildTarget:
     tool: str
@@ -34,9 +38,8 @@ TARGETS: list[BuildTarget] = [
 def run_command(cmd: list[str], cwd: pathlib.Path | None = None) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f'command failed: {" ".join(cmd)}')
-        print(f'stderr: {result.stderr}')
-        sys.exit(1)
+        error_msg = f'command failed: {" ".join(cmd)}\nstderr: {result.stderr}'
+        raise CommandError(error_msg)
     return result
 
 
@@ -106,7 +109,7 @@ def create_archive(tool_dir: pathlib.Path, target: BuildTarget, output_dir: path
 
 
 def create_checksum(archive_path: pathlib.Path) -> pathlib.Path:
-    checksum_path = archive_path.with_suffix(archive_path.suffix + '.sha256')
+    checksum_path = archive_path.parent / (archive_path.name + '.sha256')
     sha256_hash = hashlib.sha256()
     with open(archive_path, 'rb') as f:
         for chunk in iter(lambda: f.read(8192), b''):
@@ -202,8 +205,12 @@ def main() -> int:
                 return 1
 
     artifacts: list[pathlib.Path] = []
-    for target in targets:
-        artifacts.extend(build_target(repo_root, target, output_dir))
+    try:
+        for target in targets:
+            artifacts.extend(build_target(repo_root, target, output_dir))
+    except CommandError as e:
+        print(f'error: {e}')
+        return 1
 
     print(f'build complete. artifacts in {output_dir}:')
     for artifact in artifacts:

@@ -1,4 +1,4 @@
-FROM rust:latest AS builder
+FROM rust:1.83.0@sha256:a8d35e1b1e7c4dc0c82a4a06dfc4e2e7aac3e3e4b9e6a5f3a7e0a0e3f2e8e7e9 AS builder
 
 WORKDIR /build
 
