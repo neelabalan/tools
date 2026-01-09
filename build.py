@@ -93,7 +93,9 @@ def extract_binary(tool_dir: pathlib.Path, target: BuildTarget, image_tag: str) 
     print(f'extracting binary from {image_tag}')
     run_command(['docker', 'create', '--name', container_name, image_tag])
     binary_path = tool_dir / target.tool
-    run_command(['docker', 'cp', f'{container_name}:/usr/local/bin/{target.tool}', str(binary_path)])
+    run_command(
+        ['docker', 'cp', f'{container_name}:/build/target/{target.target}/release/{target.tool}', str(binary_path)]
+    )
     run_command(['docker', 'rm', container_name])
     return binary_path
 
