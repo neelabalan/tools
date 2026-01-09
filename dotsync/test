@@ -6,7 +6,7 @@ IMAGE_NAME="dotsync-test:latest"
 CONTAINER_NAME="dotsync-test-container"
 
 echo "building docker image: $IMAGE_NAME"
-docker build -t "$IMAGE_NAME" .
+docker build -f Dockerfile.test -t "$IMAGE_NAME" .
 
 echo "running container to test executable..."
 docker run --rm --name "$CONTAINER_NAME" "$IMAGE_NAME" /usr/local/bin/dotsync --help
