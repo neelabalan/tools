@@ -32,6 +32,12 @@ TARGETS: list[BuildTarget] = [
         asset_name='dotsync-linux-x86_64',
         dockerfile='Dockerfile.linux-x86_64',
     ),
+    BuildTarget(
+        tool='dotsync',
+        target='aarch64-unknown-linux-musl',
+        asset_name='dotsync-linux-aarch64',
+        dockerfile='Dockerfile.linux-aarch64',
+    ),
 ]
 
 

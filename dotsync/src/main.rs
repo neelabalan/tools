@@ -240,10 +240,7 @@ fn init(config_path: Option<std::path::PathBuf>) {
 }
 
 fn create_symlinks(files: &Vec<String>, source_dir: &String) -> Result<String, String> {
-    let mut source_path = PathBuf::from(source_dir);
-    if source_dir.ends_with('/') {
-        source_path = PathBuf::from(source_dir.trim_end_matches('/'))
-    }
+    let source_path = expand_home(source_dir.trim_end_matches('/'));
 
     for file in files {
         let target = PathBuf::from(file);
@@ -337,6 +334,34 @@ fn setup(profile: String) -> Result<(), String> {
     Ok(())
 }
 
+fn status() -> Result<(), String> {
+    let state = State::new().map_err(|e| format!("failed to read state: {}", e))?;
+
+    match &state.active_profile {
+        Some(profile) => {
+            println!("active profile: {}", profile);
+            println!();
+
+            if let Some(files) = state.profiles.get(profile) {
+                println!("synced dotfiles ({}):", files.len());
+                for file in files {
+                    let target = expand_home(file);
+                    let status = if target.is_symlink() { "+" } else { "-" };
+                    println!("  {} {}", status, file);
+                }
+            } else {
+                println!("no files found for profile '{}'", profile);
+            }
+        }
+        None => {
+            println!("no active profile set.");
+            println!("run 'dotsync setup --profile=<name>' first.")
+        }
+    }
+
+    Ok(())
+}
+
 fn main() {
     let env = Env::default().filter_or("LOG_LEVEL", "info");
     env_logger::init_from_env(env);
@@ -349,7 +374,11 @@ fn main() {
                 eprintln!("setup failed: {}", e);
             }
         }
-        Commands::Status {} => {}
+        Commands::Status {} => {
+            if let Err(e) = status() {
+                eprintln!("status failed: {}", e);
+            }
+        }
         Commands::Refresh {} => {}
         Commands::Backup {} => info!("Backup command"),
         Commands::Destroy {} => info!("Destroy command"),
