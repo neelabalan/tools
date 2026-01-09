@@ -43,7 +43,37 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Generate install instructions
+        run: |
+          cat > install.txt << 'EOF'
+          # Installation
+
+          ## Linux (x86_64)
+          ```bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/dotsync-linux-x86_64.tar.gz | tar xz
+          sudo mv dotsync /usr/local/bin/
+          ```
+
+          ## macOS (Apple Silicon)
+          ```bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/dotsync-macos-aarch64.tar.gz | tar xz
+          sudo mv dotsync /usr/local/bin/
+          ```
+
+          ## Install latest (any platform)
+          ```bash
+          # Replace PLATFORM with: linux-x86_64 or macos-aarch64
+          curl -L https://github.com/${{ github.repository }}/releases/latest/download/dotsync-PLATFORM.tar.gz | tar xz
+          ```
+
+          ## Verify checksums
+          ```bash
+          sha256sum -c dotsync-linux-x86_64.tar.gz.sha256
+          ```
+          EOF
+
       - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
+          body_path: install.txt
           generate_release_notes: true
