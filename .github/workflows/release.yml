@@ -3,8 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
-  workflow_dispatch:
+      - '*-v*'
 
 permissions:
   contents: write
@@ -24,8 +23,15 @@ jobs:
 
       - uses: astral-sh/setup-uv@v4
 
+      - name: Extract tool name from tag
+        id: extract
+        run: |
+          TAG="${{ github.ref_name }}"
+          TOOL="${TAG%%-v*}"
+          echo "tool=$TOOL" >> $GITHUB_OUTPUT
+
       - name: Build target
-        run: uv run python build.py --skip-tests --target ${{ matrix.target }} --output-dir dist
+        run: uv run python build.py --skip-tests --tool ${{ steps.extract.outputs.tool }} --target ${{ matrix.target }} --output-dir dist
 
       - uses: actions/upload-artifact@v4
         with:
@@ -35,7 +41,6 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -43,33 +48,28 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Extract tool name
+        id: extract
+        run: |
+          TAG="${{ github.ref_name }}"
+          TOOL="${TAG%%-v*}"
+          echo "tool=$TOOL" >> $GITHUB_OUTPUT
+
       - name: Generate install instructions
         run: |
-          cat > install.txt << 'EOF'
-          # Installation
-
+          TOOL="${{ steps.extract.outputs.tool }}"
+          cat > install.txt << EOF
           ## Linux (x86_64)
-          ```bash
-          curl -L https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/dotsync-linux-x86_64.tar.gz | tar xz
-          sudo mv dotsync /usr/local/bin/
-          ```
+          \`\`\`bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$TOOL-linux-x86_64.tar.gz | tar xz
+          sudo mv $TOOL /usr/local/bin/
+          \`\`\`
 
           ## macOS (Apple Silicon)
-          ```bash
-          curl -L https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/dotsync-macos-aarch64.tar.gz | tar xz
-          sudo mv dotsync /usr/local/bin/
-          ```
-
-          ## Install latest (any platform)
-          ```bash
-          # Replace PLATFORM with: linux-x86_64 or macos-aarch64
-          curl -L https://github.com/${{ github.repository }}/releases/latest/download/dotsync-PLATFORM.tar.gz | tar xz
-          ```
-
-          ## Verify checksums
-          ```bash
-          sha256sum -c dotsync-linux-x86_64.tar.gz.sha256
-          ```
+          \`\`\`bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$TOOL-macos-aarch64.tar.gz | tar xz
+          sudo mv $TOOL /usr/local/bin/
+          \`\`\`
           EOF
 
       - uses: softprops/action-gh-release@v2
