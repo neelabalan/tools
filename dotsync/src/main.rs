@@ -41,7 +41,10 @@ struct History {
 #[derive(Serialize, Deserialize, Debug)]
 struct State {
     url: String,
-    branch: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch: Option<String>,
+
     path: String,
     backup_path: String,
     profiles: HashMap<String, Vec<String>>,
@@ -51,6 +54,39 @@ struct State {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     history: Option<Vec<History>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_type: Option<SourceType>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+enum SourceType {
+    Zip,
+    GitHttps,
+    GitSsh,
+}
+
+impl std::fmt::Display for SourceType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SourceType::Zip => write!(f, "zip"),
+            SourceType::GitHttps => write!(f, "git-https"),
+            SourceType::GitSsh => write!(f, "git-ssh"),
+        }
+    }
+}
+
+fn detect_source_type(url: &str) -> SourceType {
+    if url.contains("/archive/") || url.contains("/zipball/") || url.contains("/releases/download/")
+    {
+        return SourceType::Zip;
+    }
+
+    if url.starts_with("git@") || url.starts_with("ssh://") {
+        return SourceType::GitSsh;
+    }
+
+    SourceType::GitHttps
 }
 
 impl State {
@@ -72,6 +108,11 @@ impl State {
 
     fn set_active_profile(mut self, profile: &str) -> Self {
         self.active_profile = Some(profile.to_owned());
+        self
+    }
+
+    fn set_source_type(mut self, source_type: SourceType) -> Self {
+        self.source_type = Some(source_type);
         self
     }
 
@@ -102,6 +143,14 @@ impl State {
         let readonly = fs::Permissions::from_mode(Self::READONLY_PERMISSIONS);
         fs::set_permissions(&path, readonly)?;
         info!("state file written and secured as readonly");
+        Ok(())
+    }
+
+    fn remove_file(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let state_file_path = expand_home(Self::STATE_FILE_PATH);
+        if state_file_path.exists() {
+            std::fs::remove_file(state_file_path)?;
+        } 
         Ok(())
     }
 }
@@ -147,9 +196,37 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// show the current active profile and synced dotfiles
+    ///
+    /// displays the active profile and lists all symlinked files.
+    /// files marked with '+' are properly symlinked, '-' indicates issues.
+    ///
+    /// example: dotsync status
     Status {},
+
+    /// refresh dotfiles from the repository
+    ///
+    /// pulls latest changes from the repository and updates symlinks.
+    /// useful for keeping your dotfiles in sync across machines.
+    ///
+    /// example: dotsync refresh
     Refresh {},
+
+    /// create a backup of current dotfiles
+    ///
+    /// creates a timestamped zip file of all dotfiles in the active profile.
+    /// backup is saved to the configured backup_path.
+    ///
+    /// example: dotsync backup
     Backup {},
+
+    /// remove all symlinks for the active profile
+    ///
+    /// removes all symlinks created by dotsync for the active profile.
+    /// this does not delete your actual dotfiles, only the symlinks.
+    /// the state file is also removed after cleanup.
+    ///
+    /// example: dotsync destroy
     Destroy {},
 }
 
@@ -179,12 +256,16 @@ fn clone_repository(url: &str, branch: &str, path: &PathBuf) -> Result<(), Strin
             .map_err(|e| format!("failed to create directories: {}", e))?;
     }
 
-    let output = Command::new("git")
-        .arg("clone")
-        .arg("--branch")
-        .arg(branch)
-        .arg(url)
-        .arg(path)
+    let mut cmd = Command::new("git");
+    cmd.arg("clone");
+
+    if !branch.is_empty() {
+        cmd.arg("--branch").arg(branch);
+    }
+
+    cmd.arg(url).arg(path);
+
+    let output = cmd
         .output()
         .map_err(|e| format!("failed to execute git: {}", e))?;
 
@@ -199,47 +280,94 @@ fn clone_repository(url: &str, branch: &str, path: &PathBuf) -> Result<(), Strin
     }
 }
 
-fn init(config_path: Option<std::path::PathBuf>) {
-    let config_path = match config_path {
-        Some(path) => path,
-        None => {
-            eprintln!("config file path is required");
-            return;
-        }
-    };
-
-    let config_content = match std::fs::read_to_string(&config_path) {
-        Ok(content) => content,
-        Err(e) => {
-            eprintln!("failed to read config file: {}", e);
-            return;
-        }
-    };
-
-    let config: State = match serde_json::from_str(&config_content) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            eprintln!("failed to parse config file: {}", e);
-            return;
-        }
-    };
-
-    if !git_is_installed() {
-        eprintln!("git is not installed. please install git to proceed.");
-        return;
+fn download_and_extract_zip(url: &str, path: &PathBuf) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create directories: {}", e))?;
     }
 
-    let repo_path = expand_home(&config.path);
-    info!("cloning repository from {} to {:?}", config.url, repo_path);
+    let temp_zip = path.with_extension("zip.tmp");
 
-    if let Err(e) = clone_repository(&config.url, &config.branch, &repo_path) {
-        eprintln!("{}", e);
+    let output = Command::new("curl")
+        .arg("-L")
+        .arg("-o")
+        .arg(&temp_zip)
+        .arg(url)
+        .output()
+        .map_err(|e| format!("failed to execute curl: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "curl failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
 
-    _ = config.write_state_file();
+    info!("downloaded zip file from {}", url);
+
+    let output = Command::new("unzip")
+        .arg("-q")
+        .arg(&temp_zip)
+        .arg("-d")
+        .arg(path)
+        .output()
+        .map_err(|e| format!("failed to execute unzip: {}", e))?;
+
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&temp_zip);
+        return Err(format!(
+            "unzip failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    std::fs::remove_file(&temp_zip)
+        .map_err(|e| format!("failed to remove temporary zip file: {}", e))?;
+
+    info!("successfully extracted zip to {:?}", path);
+    Ok(())
 }
 
-fn create_symlinks(files: &Vec<String>, source_dir: &String) -> Result<String, String> {
+fn init(config_path: Option<std::path::PathBuf>) -> Result<(), String> {
+    let config_path = config_path.ok_or("config file path is required")?;
+
+    let config_content = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("failed to read config file: {}", e))?;
+
+    let config: State = serde_json::from_str(&config_content)
+        .map_err(|e| format!("failed to parse config file: {}", e))?;
+
+    let source_type = detect_source_type(&config.url);
+    info!("detected source type: {}", source_type);
+
+    let repo_path = expand_home(&config.path);
+
+    match source_type {
+        SourceType::Zip => {
+            info!("downloading zip from {}", config.url);
+            download_and_extract_zip(&config.url, &repo_path)
+        }
+        SourceType::GitHttps | SourceType::GitSsh => {
+            if !git_is_installed() {
+                return Err("git is not installed. please install git to proceed.".to_string());
+            }
+            let branch = config.branch.as_deref().unwrap_or("");
+            info!("cloning repository from {} to {:?}", config.url, repo_path);
+            clone_repository(&config.url, branch, &repo_path)
+        }
+    }?;
+
+    let config = config.set_source_type(source_type);
+    config
+        .write_state_file()
+        .map_err(|e| format!("failed to write state file: {}", e))?;
+
+    Ok(())
+}
+
+// TODO: implement rollback logic - if symlink creation fails midway,
+// already-created symlinks should be cleaned up to avoid orphaned state
+fn create_symlinks(files: &Vec<String>, source_dir: &str) -> Result<String, String> {
     let source_path = expand_home(source_dir.trim_end_matches('/'));
 
     for file in files {
@@ -262,7 +390,9 @@ fn create_symlinks(files: &Vec<String>, source_dir: &String) -> Result<String, S
 
         info!("created symlink: {:?} -> {:?}", target, source);
     }
-    Ok(chrono::Local::now().format("%Y-%m-%d--%H-%M-%S").to_string())
+    Ok(chrono::Local::now()
+        .format("%Y-%m-%d--%H-%M-%S")
+        .to_string())
 }
 
 fn create_backup(files: &Vec<String>, target_dir: &str) -> Result<PathBuf, String> {
@@ -313,10 +443,14 @@ fn setup(profile: String) -> Result<(), String> {
     state = state.set_active_profile(&profile);
     info!("profile set to {}", profile);
 
-    let profile_files = state.profiles.get(&profile).or_else(|| {
-        info!("profile {} not found! trying 'default' profile", profile);
-        state.profiles.get("default")
-    }).ok_or("no 'default' profile found!")?;
+    let profile_files = state
+        .profiles
+        .get(&profile)
+        .or_else(|| {
+            info!("profile {} not found! trying 'default' profile", profile);
+            state.profiles.get("default")
+        })
+        .ok_or("no 'default' profile found!")?;
 
     let backup_dir = create_backup(profile_files, &state.backup_path)?;
     info!("backup completed at {:?}", backup_dir);
@@ -329,8 +463,10 @@ fn setup(profile: String) -> Result<(), String> {
         files: profile_files.clone(),
     };
     state = state.append_history(history);
-    state.write_state_file().map_err(|e| format!("failed to write state file: {}", e))?;
-    
+    state
+        .write_state_file()
+        .map_err(|e| format!("failed to write state file: {}", e))?;
+
     Ok(())
 }
 
@@ -345,8 +481,11 @@ fn status() -> Result<(), String> {
             if let Some(files) = state.profiles.get(profile) {
                 println!("synced dotfiles ({}):", files.len());
                 for file in files {
-                    let target = expand_home(file);
-                    let status = if target.is_symlink() { "+" } else { "-" };
+                    let status = if expand_home(file).is_symlink() {
+                        "+"
+                    } else {
+                        "-"
+                    };
                     println!("  {} {}", status, file);
                 }
             } else {
@@ -362,25 +501,51 @@ fn status() -> Result<(), String> {
     Ok(())
 }
 
+fn destroy() -> Result<(), String> {
+    let state = State::new().map_err(|e| format!("failed to read state: {}", e))?;
+    match &state.active_profile {
+        Some(profile) => {
+            println!("active profile: {}", profile);
+            if let Some(files) = state.profiles.get(profile) {
+                for file in files {
+                    match std::fs::remove_file(expand_home(file)) {
+                        Ok(_) => println!("removed {}", file),
+                        Err(e) => eprintln!("couldn't remove symlink for file {}: {:?}", file, e),
+                    }
+                }
+            } else {
+                println!("no files found for profile '{}'", profile);
+            }
+        }
+        None => {
+            println!("no active profile set.");
+        }
+    }
+    state
+        .remove_file()
+        .map_err(|e| format!("failed to remove state file: {}", e))?;
+    Ok(())
+}
+
 fn main() {
     let env = Env::default().filter_or("LOG_LEVEL", "info");
     env_logger::init_from_env(env);
     let cli = Args::parse();
 
-    match cli.command {
+    let result: Result<(), String> = match cli.command {
         Commands::Init { config } => init(config),
-        Commands::Setup { profile, .. } => {
-            if let Err(e) = setup(profile) {
-                eprintln!("setup failed: {}", e);
-            }
+        Commands::Setup { profile, .. } => setup(profile),
+        Commands::Status {} => status(),
+        Commands::Destroy {} => destroy(),
+        Commands::Refresh {} => Ok(()),
+        Commands::Backup {} => {
+            info!("Backup command");
+            Ok(())
         }
-        Commands::Status {} => {
-            if let Err(e) = status() {
-                eprintln!("status failed: {}", e);
-            }
-        }
-        Commands::Refresh {} => {}
-        Commands::Backup {} => info!("Backup command"),
-        Commands::Destroy {} => info!("Destroy command"),
+    };
+
+    if let Err(e) = result {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
     }
 }
