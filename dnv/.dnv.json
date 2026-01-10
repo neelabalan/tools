@@ -1,0 +1,214 @@
+{
+    "dotfiles": {
+        "default": [
+            ".bashrc",
+            ".bash_profile",
+            ".tmux.conf",
+            ".haskeline",
+            ".ruff.toml",
+            ".vimrc",
+            ".visidatarc",
+            ".ipython",
+            ".config/starship.toml",
+            ".config/nvim",
+            ".config/.ghc",
+            ".config/kitty",
+            ".config/mpv",
+            ".config/ranger"
+        ],
+        "container": [
+            ".bashrc",
+            ".bash_profile",
+            ".config/starship.toml",
+            ".config/nvim",
+            ".tmux.conf"
+        ]
+    },
+    "distro_config": {
+        "workstation": {
+            "distro": "alma",
+            "arch": "x86_64",
+            "container_user": "blue",
+            "volumes": [
+                {
+                    "source": "~/.ssh",
+                    "target": "/home/blue/.ssh",
+                    "mode": "ro"
+                }
+            ],
+            "tools": [
+                "python",
+                "node",
+                "rust",
+                "go",
+                "sdkman",
+                "neovim",
+                "starship",
+                "fzf",
+                "ripgrep",
+                "tokei",
+                "eza",
+                "kubectl",
+                "ipython",
+                "ranger",
+                "sysutils",
+                "ssh",
+                "docker",
+                "dotfiles"
+            ],
+            "dotfiles": "container"
+        },
+        "workstation-arm": {
+            "distro": "alma",
+            "arch": "aarch64",
+            "container_user": "blue",
+            "volumes": [
+                {
+                    "source": "~/.ssh",
+                    "target": "/home/blue/.ssh",
+                    "mode": "ro"
+                }
+            ],
+            "tools": [
+                "git",
+                "make",
+                "gcc",
+                "vim",
+                "python",
+                "node",
+                "rust",
+                "go",
+                "sdkman",
+                "neovim",
+                "starship",
+                "fzf",
+                "ripgrep",
+                "tokei",
+                "eza",
+                "kubectl",
+                "ipython",
+                "ranger",
+                "sysutils",
+                "ssh",
+                "docker",
+                "dotfiles"
+            ],
+            "dotfiles": [
+                ".bashrc",
+                ".config/starship.toml",
+                ".config/nvim",
+                ".tmux.conf"
+            ]
+        },
+        "python-minimal": {
+            "distro": "alma",
+            "arch": "x86_64",
+            "container_user": "blue",
+            "exposed_ports": [
+                8000
+            ],
+            "volumes": [
+                {
+                    "source": "~/code",
+                    "target": "/home/blue/code",
+                    "mode": "rw"
+                }
+            ],
+            "tools": [
+                "python",
+                "fzf",
+                "ripgrep",
+                "ipython",
+                "dotfiles"
+            ],
+            "dotfiles": [
+                ".bashrc",
+                ".gitconfig"
+            ]
+        },
+        "python-minimal-arm": {
+            "distro": "alma",
+            "arch": "aarch64",
+            "container_user": "blue",
+            "exposed_ports": [
+                8000
+            ],
+            "volumes": [
+                {
+                    "source": "~/code",
+                    "target": "/home/blue/code",
+                    "mode": "rw"
+                }
+            ],
+            "tools": [
+                "python",
+                "fzf",
+                "ripgrep",
+                "ipython",
+                "dotfiles"
+            ],
+            "dotfiles": [
+                ".bashrc",
+                ".gitconfig"
+            ]
+        },
+        "ml-cuda": {
+            "distro": "cuda",
+            "arch": "x86_64",
+            "container_user": "developer",
+            "working_directory": "/home/developer/workspace",
+            "volumes": [
+                {
+                    "source": "./ml-workspace",
+                    "target": "/home/developer/workspace",
+                    "mode": "rw"
+                }
+            ],
+            "dotfiles": [
+                ".bashrc",
+                ".vimrc",
+                ".gitconfig"
+            ],
+            "tools": [
+                "python",
+                "starship",
+                "neovim",
+                "dotfiles"
+            ]
+        },
+        "workstation-minimal": {
+            "distro": "alma-minimal",
+            "arch": "x86_64",
+            "container_user": "blue",
+            "volumes": [
+                {
+                    "source": "~/.ssh",
+                    "target": "/home/blue/.ssh",
+                    "mode": "ro"
+                }
+            ],
+            "tools": [
+                "python",
+                "rust",
+                "go",
+                "neovim",
+                "starship",
+                "fzf",
+                "ripgrep",
+                "eza",
+                "ipython",
+                "ranger",
+                "sysutils",
+                "ssh",
+                "dotfiles"
+            ],
+            "dotfiles": [
+                ".bashrc",
+                ".bash_profile",
+                ".config/starship.toml",
+                ".config/nvim",
+                ".tmux.conf"
+            ]
+        }
+    }
+}
