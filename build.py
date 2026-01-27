@@ -38,6 +38,23 @@ TARGETS: list[BuildTarget] = [
         asset_name='dotsync-linux-aarch64',
         dockerfile='Dockerfile.linux-aarch64',
     ),
+    BuildTarget(
+        tool='sysprobe',
+        target='aarch64-apple-darwin',
+        asset_name='sysprobe-macos-aarch64',
+    ),
+    BuildTarget(
+        tool='sysprobe',
+        target='x86_64-unknown-linux-musl',
+        asset_name='sysprobe-linux-x86_64',
+        dockerfile='Dockerfile.linux-x86_64',
+    ),
+    BuildTarget(
+        tool='sysprobe',
+        target='aarch64-unknown-linux-musl',
+        asset_name='sysprobe-linux-aarch64',
+        dockerfile='Dockerfile.linux-aarch64',
+    ),
 ]
 
 
