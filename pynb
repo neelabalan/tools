@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import pathlib
+import subprocess
+import sys
+import typing
+
+CONFIG_PATH = pathlib.Path.home() / '.dotfiles' / '.pynb.json'
+
+DEFAULT_CONFIG = {
+    'profiles': {
+        'default': {
+            'directory': '~/notebooks',
+            'python_version': '3.11',
+            'dependencies': [
+                'pandas==2.2.3',
+                'numpy==2.1.2',
+                'matplotlib==3.9.2',
+                'requests==2.32.3',
+                'ipykernel==6.29.5',
+            ],
+            'cells': [
+                [
+                    'import matplotlib.pyplot as plt',
+                    'import numpy as np',
+                    'import pandas as pd',
+                    'import requests',
+                ]
+            ],
+        },
+    }
+}
+
+
+def load_config() -> dict[str, typing.Any]:
+    if not CONFIG_PATH.exists():
+        return DEFAULT_CONFIG
+
+    try:
+        with open(CONFIG_PATH) as f:
+            config: dict[str, typing.Any] = json.load(f)
+        if 'profiles' not in config:
+            return DEFAULT_CONFIG
+        return config
+    except (json.JSONDecodeError, OSError):
+        return DEFAULT_CONFIG
+
+
+def save_config(config: dict[str, typing.Any]) -> None:
+    config_path = CONFIG_PATH
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=2)
+    config_path.chmod(0o600)
+
+
+def expand_path(path_str: str) -> pathlib.Path:
+    if not path_str or '..' in path_str:
+        raise ValueError(f'invalid path: {path_str}')
+    return pathlib.Path(path_str).expanduser().resolve()
+
+
+def initialize_config() -> None:
+    if CONFIG_PATH.exists():
+        overwrite = input(f'config already exists at {CONFIG_PATH}. overwrite? (y/n): ').strip().lower()
+        if overwrite != 'y':
+            print('initialization cancelled')
+            return
+
+    save_config(DEFAULT_CONFIG)
+    print(f'configuration initialized at {CONFIG_PATH}')
+    print('default profiles:')
+    for profile_name, profile_config in DEFAULT_CONFIG['profiles'].items():
+        print(f'  {profile_name}: {profile_config["directory"]}')
+
+
+def create_notebook_project(profile: str, folder_name: str) -> None:
+    config = load_config()
+
+    if profile not in config['profiles']:
+        print(f"error: profile '{profile}' not found in config")
+        print(f'available profiles: {", ".join(config["profiles"].keys())}')
+        sys.exit(1)
+
+    profile_config = config['profiles'][profile]
+    base_dir = expand_path(profile_config['directory'])
+    project_dir = base_dir / folder_name
+    python_version = profile_config.get('python_version', '3.11')
+    dependencies = profile_config.get('dependencies', [])
+    cells = profile_config.get('cells', [[]])
+
+    if project_dir.exists():
+        print(f'error: directory {project_dir} already exists')
+        sys.exit(1)
+
+    print(f'creating notebook project in {project_dir}...')
+
+    base_dir.mkdir(parents=True, exist_ok=True)
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f'initializing uv project with python {python_version}...')
+    result = subprocess.run(['uv', 'init', '--python', python_version], cwd=project_dir, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print(f'error initializing uv project: {result.stderr}')
+        sys.exit(1)
+
+    if dependencies:
+        print(f'installing dependencies: {", ".join(dependencies)}...')
+        result = subprocess.run(['uv', 'add'] + dependencies, cwd=project_dir, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            print(f'error installing dependencies: {result.stderr}')
+            sys.exit(1)
+
+    main_py = project_dir / 'main.py'
+    if main_py.exists():
+        main_py.unlink()
+
+    notebook_cells = []
+    for cell_source in cells:
+        notebook_cells.append(
+            {
+                'cell_type': 'code',
+                'execution_count': None,
+                'metadata': {},
+                'outputs': [],
+                'source': cell_source,
+            }
+        )
+
+    notebook_content = {
+        'cells': notebook_cells,
+        'metadata': {
+            'kernelspec': {
+                'display_name': 'Python 3',
+                'language': 'python',
+                'name': 'python3',
+            },
+            'language_info': {
+                'codemirror_mode': {'name': 'ipython', 'version': 3},
+                'file_extension': '.py',
+                'mimetype': 'text/x-python',
+                'name': 'python',
+                'nbconvert_exporter': 'python',
+                'pygments_lexer': 'ipython3',
+                'version': python_version,
+            },
+        },
+        'nbformat': 4,
+        'nbformat_minor': 5,
+    }
+
+    notebook_path = project_dir / 'notebook.ipynb'
+    with open(notebook_path, 'w') as f:
+        json.dump(notebook_content, f, indent=1)
+
+    print('notebook project created successfully!')
+
+    open_editor = input('open in vscode? (Y/n): ').strip().lower()
+    if open_editor != 'n':
+        subprocess.run(['code', str(project_dir)], check=False)
+
+
+def list_projects(profile: str) -> None:
+    config = load_config()
+
+    if profile not in config['profiles']:
+        print(f"error: profile '{profile}' not found in config")
+        print(f'available profiles: {", ".join(config["profiles"].keys())}')
+        sys.exit(1)
+
+    profile_config = config['profiles'][profile]
+    base_dir = expand_path(profile_config['directory'])
+
+    if not base_dir.exists():
+        print(f'no projects found. directory does not exist: {base_dir}')
+        return
+
+    projects = [d for d in base_dir.iterdir() if d.is_dir()]
+
+    if not projects:
+        print(f'no projects found in {base_dir}')
+        return
+
+    print(f'projects in {base_dir}:')
+    for project in sorted(projects):
+        print(f'  {project.name}')
+
+
+def open_project(profile: str, folder_name: str) -> None:
+    config = load_config()
+
+    if profile not in config['profiles']:
+        print(f"error: profile '{profile}' not found in config")
+        print(f'available profiles: {", ".join(config["profiles"].keys())}')
+        sys.exit(1)
+
+    profile_config = config['profiles'][profile]
+    base_dir = expand_path(profile_config['directory'])
+    project_dir = base_dir / folder_name
+
+    if not project_dir.exists():
+        print(f'error: project {folder_name} does not exist in {base_dir}')
+        sys.exit(1)
+
+    subprocess.run(['code', str(project_dir)], check=False)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description='Python Notebook project manager with uv',
+        epilog="""
+Commands:
+  init      Initialize or reset the configuration file with default profiles
+  new       Create a new notebook project with uv environment and dependencies
+  ls        List all notebook projects in a profile's directory
+  open      Open an existing notebook project in VS Code
+
+Profiles:
+  Profiles are defined in ~/.dotfiles/.pynb.json and specify:
+  - directory: Base directory for notebook projects
+  - python_version: Python version to use (e.g., 3.11)
+  - dependencies: List of packages to install (pandas, numpy, etc.)
+  - cells: Initial code cells to include in the notebook
+
+Default Profile:
+  The 'default' profile creates projects in ~/notebooks with Python 3.11
+  and common data science packages (pandas, numpy, matplotlib, requests)
+
+Examples:
+  %(prog)s init                                    Initialize config file
+  %(prog)s new my-analysis                         Create new project in default profile
+  %(prog)s new --profile ml experiment-01          Create project in 'ml' profile
+  %(prog)s ls                                      List projects in default profile
+  %(prog)s ls --profile ml                         List projects in 'ml' profile
+  %(prog)s open my-analysis                        Open project in VS Code
+  %(prog)s open --profile ml experiment-01         Open project from 'ml' profile
+
+Configuration:
+  Config file: ~/.dotfiles/.pynb.json
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest='command', help='available commands')
+
+    subparsers.add_parser('init', help='initialize configuration file')
+
+    new_parser = subparsers.add_parser('new', help='create a new notebook project')
+    new_parser.add_argument('--profile', '-p', default='default', help='profile to use (default: default)')
+    new_parser.add_argument('folder_name', help='name of the folder to create')
+
+    ls_parser = subparsers.add_parser('ls', help='list all notebook projects')
+    ls_parser.add_argument('--profile', '-p', default='default', help='profile to use (default: default)')
+
+    open_parser = subparsers.add_parser('open', help='open an existing notebook project')
+    open_parser.add_argument('--profile', '-p', default='default', help='profile to use (default: default)')
+    open_parser.add_argument('folder_name', help='name of the folder to open')
+
+    args = parser.parse_args()
+
+    if args.command == 'init':
+        initialize_config()
+    elif args.command == 'new':
+        create_notebook_project(args.profile, args.folder_name)
+    elif args.command == 'ls':
+        list_projects(args.profile)
+    elif args.command == 'open':
+        open_project(args.profile, args.folder_name)
+    else:
+        parser.print_help()
+
+
+if __name__ == '__main__':
+    if sys.version_info < (3, 11):
+        print('error: this script requires Python 3.11 or later')
+        sys.exit(1)
+    main()

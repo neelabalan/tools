@@ -1,0 +1,1719 @@
+#!/usr/bin/env python3
+
+import argparse
+import dataclasses
+import datetime
+import functools
+import io
+import logging
+import os
+import pathlib
+import platform
+import shlex
+import shutil
+import string
+import subprocess
+import sys
+import textwrap
+import time
+import typing
+
+
+class ContainerEngine:
+    _cached_engine: str | None = None
+
+    @classmethod
+    def _detect(cls) -> str:
+        if cls._cached_engine is None:
+            env_engine = os.environ.get('CONTAINER_ENGINE')
+            if env_engine:
+                if shutil.which(env_engine):
+                    cls._cached_engine = env_engine
+                else:
+                    raise RuntimeError(f'CONTAINER_ENGINE={env_engine} not found in PATH')
+            elif shutil.which('podman'):
+                cls._cached_engine = 'podman'
+            elif shutil.which('docker'):
+                cls._cached_engine = 'docker'
+            else:
+                raise RuntimeError('no container engine found (docker or podman)')
+        return cls._cached_engine
+
+    @classmethod
+    def cmd(cls, *args: str) -> list[str]:
+        return [cls._detect(), *args]
+
+    @classmethod
+    def engine(cls) -> str:
+        return cls._detect()
+
+    @classmethod
+    def image_prune_cmd(cls) -> list[str]:
+        return [cls._detect(), 'image', 'prune', '-f']
+
+
+class ToolTemplate(string.Template):
+    delimiter = '<%>'
+
+
+@dataclasses.dataclass
+class Tool:
+    setup_template: list[str] | None = None
+    depends_on: list[str] | None = None
+    env: list[dict[str, str]] | None = None
+    copy: list[dict[str, str]] | None = None
+    version: str = ''
+    arch_map: dict[str, str] | None = None
+    current_arch: str = ''
+
+    @property
+    def setup(self) -> list[str]:
+        if not self.setup_template:
+            return []
+
+        if not any('<%>' in cmd for cmd in self.setup_template):
+            return self.setup_template
+
+        arch_value = self.arch_map.get(self.current_arch, '') if self.arch_map else ''
+        resolved = []
+        for cmd in self.setup_template:
+            try:
+                template = ToolTemplate(cmd)
+                resolved.append(template.safe_substitute(version=self.version, arch=arch_value))
+            except (KeyError, ValueError):
+                resolved.append(cmd)
+        return resolved
+
+
+@dataclasses.dataclass
+class DistroConfig:
+    name: str
+    pkg_format: str
+    base_image: str
+    pkg_install: str
+    pkg_install_flags: str
+    pkg_update: str
+
+    def install(self, *packages: str) -> str:
+        pkgs = ' '.join(packages)
+        if self.pkg_install_flags:
+            return f'{self.pkg_install} {pkgs} {self.pkg_install_flags}'
+        return f'{self.pkg_install} {pkgs}'
+
+    def install_nosudo(self, *packages: str) -> str:
+        pkgs = ' '.join(packages)
+        cmd = self.pkg_install.removeprefix('sudo ')
+        if self.pkg_install_flags:
+            return f'{cmd} {pkgs} {self.pkg_install_flags}'
+        return f'{cmd} {pkgs}'
+
+    def docker_install_cmd(self) -> str:
+        raise NotImplementedError('subclass must implement docker_install_cmd')
+
+    def gcc_package(self) -> str:
+        raise NotImplementedError('subclass must implement gcc_package')
+
+    def sysutils_packages(self) -> list[str]:
+        raise NotImplementedError('subclass must implement sysutils_packages')
+
+    def mirror_config(self) -> str:
+        raise NotImplementedError('subclass must implement mirror_config')
+
+
+@dataclasses.dataclass
+class DebianDistroConfig(DistroConfig):
+    name: str = 'debian'
+    pkg_format: str = 'deb'
+    base_image: str = 'debian:bookworm'
+    pkg_install: str = 'sudo apt install -y'
+    pkg_install_flags: str = ''
+    pkg_update: str = 'apt update && apt upgrade -y'
+
+    def docker_install_cmd(self) -> str:
+        return textwrap.dedent("""
+            sudo install -m 0755 -d /etc/apt/keyrings && \\
+            sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc && \\
+            sudo chmod a+r /etc/apt/keyrings/docker.asc && \\
+            echo \\
+              "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \\
+              $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \\
+              sudo tee /etc/apt/sources.list.d/docker.list > /dev/null && \\
+            sudo apt-get update -y && \\
+            sudo apt-get install docker-ce-cli -y
+        """).strip()
+
+    def gcc_package(self) -> str:
+        return 'build-essential'
+
+    def sysutils_packages(self) -> list[str]:
+        return ['procps', 'iproute2']
+
+    def mirror_config(self) -> str:
+        return 'echo "Acquire::Retries \\"3\\";" > /etc/apt/apt.conf.d/80-retries'
+
+
+class RpmDistroConfig(DistroConfig):
+    def docker_install_cmd(self) -> str:
+        return textwrap.dedent("""
+            sudo dnf -y install dnf-plugins-core && \\
+            sudo dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo && \\
+            sudo dnf install -y docker-ce-cli
+        """).strip()
+
+    def gcc_package(self) -> str:
+        return 'gcc'
+
+    def sysutils_packages(self) -> list[str]:
+        return ['procps', 'iproute']
+
+    def mirror_config(self) -> str:
+        return 'echo "fastestmirror=True" >> /etc/dnf/dnf.conf && echo "max_parallel_downloads=10" >> /etc/dnf/dnf.conf'
+
+
+@dataclasses.dataclass
+class AlmaDistroConfig(RpmDistroConfig):
+    name: str = 'alma'
+    pkg_format: str = 'rpm'
+    base_image: str = 'almalinux:9'
+    pkg_install: str = 'sudo dnf install -y'
+    pkg_install_flags: str = '--skip-broken'
+    pkg_update: str = 'dnf update -y'
+
+
+@dataclasses.dataclass
+class AlmaMinimalDistroConfig(RpmDistroConfig):
+    name: str = 'alma-minimal'
+    pkg_format: str = 'rpm'
+    base_image: str = 'almalinux:9-minimal'
+    pkg_install: str = 'sudo microdnf install -y'
+    pkg_install_flags: str = ''
+    pkg_update: str = 'microdnf update -y'
+
+    def install(self, *packages: str) -> str:
+        filtered = [p for p in packages if p != 'curl']
+        if not filtered:
+            return 'true'
+        pkgs = ' '.join(filtered)
+        return f'{self.pkg_install} {pkgs}'
+
+    def docker_install_cmd(self) -> str:
+        return textwrap.dedent("""
+            sudo microdnf -y install dnf-plugins-core && \\
+            sudo dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo && \\
+            sudo microdnf install -y docker-ce-cli
+        """).strip()
+
+    def mirror_config(self) -> str:
+        return 'true'
+
+
+@dataclasses.dataclass
+class FedoraDistroConfig(RpmDistroConfig):
+    name: str = 'fedora'
+    pkg_format: str = 'rpm'
+    base_image: str = 'fedora:41'
+    pkg_install: str = 'sudo dnf install -y'
+    pkg_install_flags: str = ''
+    pkg_update: str = 'dnf update -y'
+
+
+@dataclasses.dataclass
+class CudaDistroConfig(RpmDistroConfig):
+    name: str = 'cuda'
+    pkg_format: str = 'rpm'
+    base_image: str = 'nvidia/cuda:11.8.0-runtime-ubi8'
+    pkg_install: str = 'sudo dnf install -y'
+    pkg_install_flags: str = '--skip-broken'
+    pkg_update: str = 'dnf update -y'
+
+
+@dataclasses.dataclass
+class DarwinDistroConfig(DistroConfig):
+    name: str = 'darwin'
+    pkg_format: str = 'none'
+    base_image: str = ''
+    pkg_install: str = 'true'  # no-op, tools installed via direct download
+    pkg_install_flags: str = ''
+    pkg_update: str = 'true'
+
+    def install(self, *packages: str) -> str:
+        # macos has curl, tar, git via xcode command line tools
+        return 'true'
+
+    def install_nosudo(self, *packages: str) -> str:
+        return 'true'
+
+    def docker_install_cmd(self) -> str:
+        return 'echo "install docker desktop from https://www.docker.com/products/docker-desktop"'
+
+    def gcc_package(self) -> str:
+        return 'xcode-select --install || true'
+
+    def sysutils_packages(self) -> list[str]:
+        return []
+
+    def mirror_config(self) -> str:
+        return 'true'
+
+
+def resolve_dependencies(tools: dict[str, Tool], selected: list[str]) -> list[str]:
+    resolved: list[str] = []
+    visited: set[str] = set()
+    in_stack: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in visited:
+            return
+        if name in in_stack:
+            raise ValueError(f'circular dependency detected: {name}')
+        if name not in tools:
+            raise ValueError(f'unknown tool: {name}')
+
+        in_stack.add(name)
+        for dep in tools[name].depends_on or []:
+            visit(dep)
+        in_stack.remove(name)
+        visited.add(name)
+        resolved.append(name)
+
+    for tool_name in selected:
+        visit(tool_name)
+
+    return resolved
+
+
+def _init_logger() -> logging.Logger:
+    debug_enabled = os.environ.get('DEBUG', '').lower() in ('1', 'true')
+    level = logging.DEBUG if debug_enabled else logging.INFO
+
+    logger = logging.getLogger('dnv')
+    if logger.handlers:
+        logger.setLevel(level)
+        for handler in logger.handlers:
+            handler.setLevel(level)
+        return logger
+
+    logger.setLevel(level)
+    logger.propagate = False
+    fmt = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(fmt)
+    console_handler.setLevel(level)
+    logger.addHandler(console_handler)
+
+    if debug_enabled:
+        log_dir = pathlib.Path.home() / '.dotfiles' / '.logs' / 'dnv'
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f'dnv_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        file_handler.setFormatter(fmt)
+        file_handler.setLevel(level)
+        logger.addHandler(file_handler)
+        logger.debug('logger initialized (level=%s) file=%s', logging.getLevelName(level), log_file)
+
+    return logger
+
+
+logger = _init_logger()
+
+
+def get_host_architecture() -> str:
+    machine = platform.machine().lower()
+    if machine in ('x86_64', 'amd64'):
+        return 'x86_64'
+    elif machine in ('aarch64', 'arm64'):
+        return 'aarch64'
+    else:
+        return 'x86_64'
+
+
+def get_docker_platform_flag(profile_arch: str) -> list[str]:
+    host_arch = get_host_architecture()
+    if host_arch != profile_arch:
+        if profile_arch == 'x86_64':
+            return ['--platform', 'linux/amd64']
+        elif profile_arch == 'aarch64':
+            return ['--platform', 'linux/arm64']
+    return []
+
+
+class DockerfileTemplate(string.Template):
+    delimiter = '<$>'
+
+
+class DevEnvironmentConfig:
+    DISTROS: dict[str, DistroConfig] = {
+        'debian': DebianDistroConfig(),
+        'alma': AlmaDistroConfig(),
+        'alma-minimal': AlmaMinimalDistroConfig(),
+        'fedora': FedoraDistroConfig(),
+        'cuda': CudaDistroConfig(),
+        'darwin': DarwinDistroConfig(),
+    }
+
+    WORKSTATION_TOOLS = [
+        'python',
+        'node',
+        'rust',
+        'go',
+        'sdkman',
+        'neovim',
+        'starship',
+        'fzf',
+        'ripgrep',
+        'tokei',
+        'eza',
+        'kubectl',
+        'ipython',
+        'ranger',
+        'sysutils',
+        'ssh',
+        'docker',
+        'dotfiles',
+    ]
+
+    ARM_BUILD_TOOLS = ['git', 'make', 'gcc', 'vim']
+
+    PYTHON_MINIMAL_TOOLS = ['python', 'fzf', 'ripgrep', 'ipython', 'dotfiles']
+
+    MINIMAL_WORKSTATION_TOOLS = [
+        'python',
+        'rust',
+        'go',
+        'neovim',
+        'starship',
+        'fzf',
+        'ripgrep',
+        'eza',
+        'ipython',
+        'ranger',
+        'sysutils',
+        'ssh',
+        'dotfiles',
+    ]
+
+    SSH_VOLUME = {'source': '~/.ssh', 'target': '/home/blue/.ssh', 'mode': 'ro'}
+    CODE_VOLUME = {'source': '~/code', 'target': '/home/blue/code', 'mode': 'rw'}
+    ML_WORKSPACE_VOLUME = {'source': './ml-workspace', 'target': '/home/developer/workspace', 'mode': 'rw'}
+
+    PROFILES: dict[str, dict[str, typing.Any]] = {
+        'just-dotfiles': {},
+        'workstation': {
+            'distro': 'alma',
+            'arch': 'x86_64',
+            'container_user': 'blue',
+            'volumes': [SSH_VOLUME],
+            'tools': WORKSTATION_TOOLS,
+        },
+        'workstation-arm': {
+            'distro': 'alma',
+            'arch': 'aarch64',
+            'container_user': 'blue',
+            'volumes': [SSH_VOLUME],
+            'tools': ARM_BUILD_TOOLS + WORKSTATION_TOOLS,
+        },
+        'python-minimal': {
+            'distro': 'alma',
+            'arch': 'x86_64',
+            'container_user': 'blue',
+            'exposed_ports': [8000],
+            'volumes': [CODE_VOLUME],
+            'tools': PYTHON_MINIMAL_TOOLS,
+        },
+        'python-minimal-arm': {
+            'distro': 'alma',
+            'arch': 'aarch64',
+            'container_user': 'blue',
+            'exposed_ports': [8000],
+            'volumes': [CODE_VOLUME],
+            'tools': PYTHON_MINIMAL_TOOLS,
+        },
+        'ml-cuda': {
+            'distro': 'cuda',
+            'arch': 'x86_64',
+            'container_user': 'developer',
+            'working_directory': '/home/developer/workspace',
+            'volumes': [ML_WORKSPACE_VOLUME],
+            'tools': ['python', 'starship', 'neovim', 'dotfiles'],
+        },
+        'workstation-minimal': {
+            'distro': 'alma-minimal',
+            'arch': 'x86_64',
+            'container_user': 'blue',
+            'volumes': [SSH_VOLUME],
+            'tools': MINIMAL_WORKSTATION_TOOLS,
+        },
+        'ws-deb': {
+            'distro': 'debian',
+            'arch': 'x86_64',
+            'container_user': 'blue',
+            'volumes': [SSH_VOLUME],
+            'tools': WORKSTATION_TOOLS,
+        },
+        'ws-deb-arm': {
+            'distro': 'debian',
+            'arch': 'aarch64',
+            'container_user': 'blue',
+            'volumes': [SSH_VOLUME],
+            'tools': ARM_BUILD_TOOLS + WORKSTATION_TOOLS,
+        },
+        'macos': {
+            'distro': 'darwin',
+            'arch': 'aarch64',
+            'container_user': '',
+            'volumes': [],
+            'tools': [
+                'python',
+                'node',
+                'rust',
+                'go',
+                'sdkman',
+                'neovim',
+                'starship',
+                'fzf',
+                'ripgrep',
+                'tokei',
+                'eza',
+                'bat',
+                'fd',
+                'btop',
+                'age',
+                'jq',
+                'yq',
+                'helm',
+                'hurl',
+                'zoxide',
+                'yazi',
+                'typst',
+                'tree-sitter',
+                'kubectl',
+                'ipython',
+                'ranger',
+                'dotfiles',
+            ],
+        },
+    }
+
+    @classmethod
+    def from_profile(cls, profile: str) -> 'DevEnvironmentConfig':
+        profile_data = cls.PROFILES.get(profile)
+        if not profile_data:
+            available = list(cls.PROFILES.keys())
+            raise ValueError(f"profile '{profile}' not found. available profiles: {available}")
+
+        return cls(
+            distro=profile_data.get('distro', 'alma'),
+            arch=profile_data.get('arch', 'x86_64'),
+            username=profile_data.get('container_user', 'blue'),
+            profile=profile,
+        )
+
+    def __init__(
+        self,
+        distro: str = 'alma',
+        arch: str = 'x86_64',
+        username: str = 'blue',
+        profile: str | None = None,
+    ) -> None:
+        self.distro = distro
+        self.username = username
+        self.profile = profile
+        self.host_arch = arch
+
+        self._setup_distro_config()
+        self.conf = self._generate_conf()
+
+    def get_profile_data(self) -> dict[str, typing.Any]:
+        if self.profile and self.profile in self.PROFILES:
+            return self.PROFILES[self.profile]
+        return {}
+
+    def _setup_distro_config(self) -> None:
+        if self.distro not in self.DISTROS:
+            raise ValueError(f'unsupported distro: {self.distro}. supported: {list(self.DISTROS.keys())}')
+
+        self.current_distro_config = self.DISTROS[self.distro]
+
+    def _generate_conf(self) -> dict[str, Tool]:
+        pkg = self.current_distro_config
+        effective_arch = f'darwin-{self.host_arch}' if self.distro == 'darwin' else self.host_arch
+        ToolWithArch = functools.partial(Tool, current_arch=effective_arch)
+
+        all_tools: dict[str, Tool] = {
+            'curl': Tool(
+                setup_template=[pkg.install('curl')],
+            ),
+            'tar': Tool(
+                setup_template=[pkg.install('tar')],
+            ),
+            'unzip': Tool(
+                setup_template=[pkg.install('unzip')],
+            ),
+            'zip': Tool(
+                setup_template=[pkg.install('zip')],
+            ),
+            'git': Tool(
+                setup_template=[pkg.install('git')],
+            ),
+            'make': Tool(
+                setup_template=[pkg.install('make')],
+            ),
+            'gcc': Tool(
+                setup_template=[pkg.install(pkg.gcc_package())],
+            ),
+            'vim': Tool(
+                setup_template=[pkg.install('vim')],
+            ),
+            'ranger': Tool(
+                depends_on=['python'],
+                setup_template=['uv tool install ranger-fm'],
+            ),
+            'sysutils': Tool(
+                setup_template=[pkg.install(*pkg.sysutils_packages())],
+            ),
+            'openssh': Tool(
+                setup_template=[pkg.install('openssh-server')],
+            ),
+            'python': ToolWithArch(
+                depends_on=['curl', 'tar'],
+                env=[{'PATH': '$HOME/.local/bin:$PATH'}],
+                version='0.7.9',
+                setup_template=[
+                    'curl -LsSf https://astral.sh/uv/<%>version/install.sh | sh && uv python install 3.11 3.13'
+                ],
+            ),
+            'node': ToolWithArch(
+                depends_on=['curl'],
+                version='v0.39.2',
+                setup_template=[
+                    """curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/<%>version/install.sh | bash && \\
+                    export NVM_DIR=$HOME/.nvm && \\
+                    source $NVM_DIR/nvm.sh && nvm install 22"""
+                ],
+            ),
+            'rust': Tool(
+                depends_on=['curl'],
+                setup_template=['curl https://sh.rustup.rs -sSf | bash -s -- -y --no-modify-path'],
+                env=[{'PATH': '$PATH:$HOME/.cargo/bin'}],
+            ),
+            'go': ToolWithArch(
+                depends_on=['curl', 'tar'],
+                version='go1.23.9',
+                arch_map={
+                    'x86_64': 'linux-amd64',
+                    'aarch64': 'linux-arm64',
+                    'darwin-aarch64': 'darwin-arm64',
+                },
+                setup_template=[
+                    """curl -LO https://go.dev/dl/<%>version.<%>arch.tar.gz && \\
+                    sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf <%>version.<%>arch.tar.gz && \\
+                    rm <%>version.<%>arch.tar.gz && \\
+                    echo 'export PATH=$PATH:/usr/local/go/bin' >> $HOME/.bashrc""",
+                ],
+                env=[{'PATH': '$PATH:/usr/local/go/bin'}],
+            ),
+            'sdkman': Tool(
+                depends_on=['curl', 'unzip', 'zip'],
+                setup_template=['curl -s "https://get.sdkman.io" | bash'],
+            ),
+            'pnpm': ToolWithArch(
+                depends_on=['curl', 'node'],
+                version='9.15.9',
+                setup_template=['curl -fsSL https://get.pnpm.io/install.sh | env PNPM_VERSION=<%>version sh -'],
+            ),
+            'ipython': Tool(
+                depends_on=['python'],
+                setup_template=['uv tool install --python 3.11 ipython'],
+            ),
+            'neovim': ToolWithArch(
+                depends_on=['curl', 'tar', 'dotfiles'],
+                version='0.11.0',
+                arch_map={
+                    'x86_64': 'linux-x86_64',
+                    'aarch64': 'linux-arm64',
+                    'darwin-aarch64': 'macos-arm64',
+                },
+                setup_template=[
+                    """curl -LO https://github.com/neovim/neovim/releases/download/v<%>version/nvim-<%>arch.tar.gz && \\
+                    mkdir -p $HOME/.local/nvim && tar -C $HOME/.local/nvim -xzf nvim-<%>arch.tar.gz --strip-components=1 && \\
+                    ln -sf $HOME/.local/nvim/bin/nvim $HOME/.local/bin/nvim && \\
+                    rm nvim-<%>arch.tar.gz""",
+                    """nvim --headless "+Lazy! sync" +qa""",
+                ],
+            ),
+            'starship': Tool(
+                depends_on=['curl'],
+                setup_template=['curl -sS https://starship.rs/install.sh | sh -s -- -y && mkdir -p $HOME/.config'],
+            ),
+            'fzf': ToolWithArch(
+                depends_on=['curl', 'tar'],
+                version='0.56.3',
+                arch_map={
+                    'x86_64': 'linux_amd64',
+                    'aarch64': 'linux_arm64',
+                    'darwin-aarch64': 'darwin_arm64',
+                },
+                setup_template=[
+                    """curl -LO https://github.com/junegunn/fzf/releases/download/v<%>version/fzf-<%>version-<%>arch.tar.gz && \\
+                    tar -xzf fzf-<%>version-<%>arch.tar.gz && \\
+                    mv fzf $HOME/.local/bin/ && rm fzf-<%>version-<%>arch.tar.gz"""
+                ],
+            ),
+            'ripgrep': ToolWithArch(
+                depends_on=['curl', 'tar'],
+                version='14.1.1',
+                arch_map={
+                    'x86_64': 'x86_64-unknown-linux-musl',
+                    'aarch64': 'aarch64-unknown-linux-gnu',
+                    'darwin-aarch64': 'aarch64-apple-darwin',
+                },
+                setup_template=[
+                    """curl -LO https://github.com/BurntSushi/ripgrep/releases/download/<%>version/ripgrep-<%>version-<%>arch.tar.gz && \\
+                    tar -xzf ripgrep-<%>version-<%>arch.tar.gz && \\
+                    mv ripgrep-<%>version-<%>arch/rg $HOME/.local/bin/ && \\
+                    rm -rf ripgrep-<%>version-<%>arch*"""
+                ],
+            ),
+            'tokei': ToolWithArch(
+                depends_on=['rust', 'gcc'],
+                version='12.1.2',
+                arch_map={
+                    'x86_64': 'x86_64',
+                    'aarch64': 'aarch64',
+                    'darwin-aarch64': 'aarch64',
+                },
+                setup_template=['cargo install tokei --version <%>version --locked'],
+            ),
+            'eza': ToolWithArch(
+                depends_on=['rust', 'gcc'],
+                version='0.21.1',
+                arch_map={
+                    'x86_64': 'x86_64',
+                    'aarch64': 'aarch64',
+                    'darwin-aarch64': 'aarch64',
+                },
+                setup_template=['cargo install eza --version <%>version --locked'],
+            ),
+            'bat': ToolWithArch(
+                depends_on=['curl', 'tar'],
+                version='0.24.0',
+                arch_map={
+                    'x86_64': 'x86_64-unknown-linux-musl',
+                    'aarch64': 'aarch64-unknown-linux-gnu',
+                    'darwin-aarch64': 'aarch64-apple-darwin',
+                },
+                setup_template=[
+                    """curl -LO https://github.com/sharkdp/bat/releases/download/v<%>version/bat-v<%>version-<%>arch.tar.gz && \\
+                    tar -xzf bat-v<%>version-<%>arch.tar.gz && \\
+                    mv bat-v<%>version-<%>arch/bat $HOME/.local/bin/ && \\
+                    rm -rf bat-v<%>version-<%>arch*"""
+                ],
+            ),
+            'fd': ToolWithArch(
+                depends_on=['curl', 'tar'],
+                version='10.2.0',
+                arch_map={
+                    'x86_64': 'x86_64-unknown-linux-musl',
+                    'aarch64': 'aarch64-unknown-linux-gnu',
+                    'darwin-aarch64': 'aarch64-apple-darwin',
+                },
+                setup_template=[
+                    """curl -LO https://github.com/sharkdp/fd/releases/download/v<%>version/fd-v<%>version-<%>arch.tar.gz && \\
+                    tar -xzf fd-v<%>version-<%>arch.tar.gz && \\
+                    mv fd-v<%>version-<%>arch/fd $HOME/.local/bin/ && \\
+                    rm -rf fd-v<%>version-<%>arch*"""
+                ],
+            ),
+            'btop': ToolWithArch(
+                depends_on=['curl', 'tar'],
+                version='1.4.0',
+                arch_map={
+                    'x86_64': 'x86_64-linux-musl',
+                    'aarch64': 'aarch64-linux-musl',
+                    'darwin-aarch64': 'aarch64-macos',
+                },
+                setup_template=[
+                    """curl -LO https://github.com/aristocratos/btop/releases/download/v<%>version/btop-<%>arch.tbz && \\
+                    tar -xjf btop-<%>arch.tbz && \\
+                    mv btop/bin/btop $HOME/.local/bin/ && \\
+                    rm -rf btop btop-<%>arch.tbz"""
+                ],
+            ),
+            'age': ToolWithArch(
+                depends_on=['curl', 'tar'],
+                version='1.2.0',
+                arch_map={
+                    'x86_64': 'linux-amd64',
+                    'aarch64': 'linux-arm64',
+                    'darwin-aarch64': 'darwin-arm64',
+                },
+                setup_template=[
+                    """curl -LO https://github.com/FiloSottile/age/releases/download/v<%>version/age-v<%>version-<%>arch.tar.gz && \\
+                    tar -xzf age-v<%>version-<%>arch.tar.gz && \\
+                    mv age/age age/age-keygen $HOME/.local/bin/ && \\
+                    rm -rf age age-v<%>version-<%>arch.tar.gz"""
+                ],
+            ),
+            'jq': ToolWithArch(
+                depends_on=['curl'],
+                version='1.7.1',
+                arch_map={
+                    'x86_64': 'linux-amd64',
+                    'aarch64': 'linux-arm64',
+                    'darwin-aarch64': 'macos-arm64',
+                },
+                setup_template=[
+                    """curl -LO https://github.com/jqlang/jq/releases/download/jq-<%>version/jq-<%>arch && \\
+                    chmod +x jq-<%>arch && mv jq-<%>arch $HOME/.local/bin/jq"""
+                ],
+            ),
+            'yq': ToolWithArch(
+                depends_on=['curl'],
+                version='4.44.3',
+                arch_map={
+                    'x86_64': 'linux_amd64',
+                    'aarch64': 'linux_arm64',
+                    'darwin-aarch64': 'darwin_arm64',
+                },
+                setup_template=[
+                    """curl -LO https://github.com/mikefarah/yq/releases/download/v<%>version/yq_<%>arch && \\
+                    chmod +x yq_<%>arch && mv yq_<%>arch $HOME/.local/bin/yq"""
+                ],
+            ),
+            'helm': ToolWithArch(
+                depends_on=['curl', 'tar'],
+                version='3.16.3',
+                arch_map={
+                    'x86_64': 'linux-amd64',
+                    'aarch64': 'linux-arm64',
+                    'darwin-aarch64': 'darwin-arm64',
+                },
+                setup_template=[
+                    """curl -LO https://get.helm.sh/helm-v<%>version-<%>arch.tar.gz && \\
+                    tar -xzf helm-v<%>version-<%>arch.tar.gz && \\
+                    mv <%>arch/helm $HOME/.local/bin/ && \\
+                    rm -rf <%>arch helm-v<%>version-<%>arch.tar.gz"""
+                ],
+            ),
+            'hurl': ToolWithArch(
+                depends_on=['curl', 'tar'],
+                version='5.0.1',
+                arch_map={
+                    'x86_64': 'x86_64-unknown-linux-gnu',
+                    'aarch64': 'aarch64-unknown-linux-gnu',
+                    'darwin-aarch64': 'aarch64-apple-darwin',
+                },
+                setup_template=[
+                    """curl -LO https://github.com/Orange-OpenSource/hurl/releases/download/<%>version/hurl-<%>version-<%>arch.tar.gz && \\
+                    tar -xzf hurl-<%>version-<%>arch.tar.gz && \\
+                    mv hurl-<%>version-<%>arch/bin/hurl $HOME/.local/bin/ && \\
+                    rm -rf hurl-<%>version-<%>arch*"""
+                ],
+            ),
+            'zoxide': ToolWithArch(
+                depends_on=['curl', 'tar'],
+                version='0.9.6',
+                arch_map={
+                    'x86_64': 'x86_64-unknown-linux-musl',
+                    'aarch64': 'aarch64-unknown-linux-musl',
+                    'darwin-aarch64': 'aarch64-apple-darwin',
+                },
+                setup_template=[
+                    """curl -LO https://github.com/ajeetdsouza/zoxide/releases/download/v<%>version/zoxide-<%>version-<%>arch.tar.gz && \\
+                    tar -xzf zoxide-<%>version-<%>arch.tar.gz && \\
+                    mv zoxide $HOME/.local/bin/ && \\
+                    rm zoxide-<%>version-<%>arch.tar.gz"""
+                ],
+            ),
+            'yazi': ToolWithArch(
+                depends_on=['curl', 'tar', 'unzip'],
+                version='0.4.2',
+                arch_map={
+                    'x86_64': 'x86_64-unknown-linux-musl',
+                    'aarch64': 'aarch64-unknown-linux-musl',
+                    'darwin-aarch64': 'aarch64-apple-darwin',
+                },
+                setup_template=[
+                    """curl -LO https://github.com/sxyazi/yazi/releases/download/v<%>version/yazi-<%>arch.zip && \\
+                    unzip -o yazi-<%>arch.zip && \\
+                    mv yazi-<%>arch/yazi $HOME/.local/bin/ && \\
+                    rm -rf yazi-<%>arch*"""
+                ],
+            ),
+            'typst': ToolWithArch(
+                depends_on=['curl', 'tar'],
+                version='0.12.0',
+                arch_map={
+                    'x86_64': 'x86_64-unknown-linux-musl',
+                    'aarch64': 'aarch64-unknown-linux-musl',
+                    'darwin-aarch64': 'aarch64-apple-darwin',
+                },
+                setup_template=[
+                    """curl -LO https://github.com/typst/typst/releases/download/v<%>version/typst-<%>arch.tar.xz && \\
+                    tar -xJf typst-<%>arch.tar.xz && \\
+                    mv typst-<%>arch/typst $HOME/.local/bin/ && \\
+                    rm -rf typst-<%>arch*"""
+                ],
+            ),
+            'tree-sitter': ToolWithArch(
+                depends_on=['curl', 'tar'],
+                version='0.24.5',
+                arch_map={
+                    'x86_64': 'linux-x64',
+                    'aarch64': 'linux-arm64',
+                    'darwin-aarch64': 'macos-arm64',
+                },
+                setup_template=[
+                    """curl -LO https://github.com/tree-sitter/tree-sitter/releases/download/v<%>version/tree-sitter-<%>arch.gz && \\
+                    gunzip tree-sitter-<%>arch.gz && \\
+                    chmod +x tree-sitter-<%>arch && \\
+                    mv tree-sitter-<%>arch $HOME/.local/bin/tree-sitter"""
+                ],
+            ),
+            'kubectl': ToolWithArch(
+                depends_on=['curl'],
+                version='v1.33.1',
+                arch_map={
+                    'x86_64': 'linux/amd64',
+                    'aarch64': 'linux/arm64',
+                    'darwin-aarch64': 'darwin/arm64',
+                },
+                setup_template=[
+                    """curl -LO https://dl.k8s.io/release/<%>version/bin/<%>arch/kubectl && \\
+                    chmod +x kubectl && mv kubectl $HOME/.local/bin/kubectl"""
+                ],
+            ),
+            'ssh': Tool(
+                depends_on=['openssh'],
+                setup_template=[
+                    """sudo sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && \\
+                    sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config && \\
+                    sudo sed -i 's/^#*UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config && \\
+                    sudo ssh-keygen -A"""
+                ],
+            ),
+            'docker': Tool(
+                depends_on=['curl'],
+                setup_template=[pkg.docker_install_cmd()],
+            ),
+            'dotsync': ToolWithArch(
+                depends_on=['curl', 'git'],
+                version='0.0.2',
+                arch_map={
+                    'x86_64': 'linux-x86_64',
+                    'aarch64': 'linux-aarch64',
+                    'darwin-aarch64': 'darwin-aarch64',
+                },
+                setup_template=[
+                    'curl -L https://github.com/neelabalan/tools/releases/download/dotsync-v<%>version/dotsync-<%>arch.tar.gz | tar xz',
+                    'mv dotsync $HOME/.local/bin/',
+                ],
+            ),
+            'dotfiles': Tool(
+                depends_on=['dotsync'],
+                copy=[
+                    {'source': 'dotsync.json', 'destination': 'dotsync.json'},
+                ],
+                setup_template=[
+                    'dotsync init --config $HOME/dotsync.json',
+                    f'dotsync setup --profile {self.profile}',
+                ]
+                if self.profile
+                else [],
+            ),
+            'cleanup': Tool(
+                setup_template=[
+                    'dnf clean all'
+                    if pkg.pkg_format == 'rpm'
+                    else 'sudo apt-get clean && sudo rm -rf /var/lib/apt/lists/*'
+                ],
+            ),
+        }
+
+        if self.profile and self.profile in self.PROFILES:
+            profile_data = self.PROFILES[self.profile]
+            tools_to_include = profile_data.get('tools', [])
+            resolved_order = resolve_dependencies(all_tools, tools_to_include)
+            return {name: all_tools[name] for name in resolved_order}
+
+        return all_tools
+
+
+def normalize_indent_after_first_line(s: str, indent: int = 4) -> str:
+    lines = s.splitlines()
+    if not lines:
+        return s
+
+    first_line = lines[0]
+    rest_lines = lines[1:]
+
+    normalized = [first_line]
+    for line in rest_lines:
+        if line.strip() == '':
+            normalized.append('')
+        else:
+            normalized.append(' ' * indent + line.lstrip())
+
+    return '\n'.join(normalized)
+
+
+class DockerfileBuilder:
+    DOCKERFILE_BASE_TEMPLATE = textwrap.dedent("""
+        # NOTE: This Dockerfile is generated. Do not edit manually.
+        FROM <$>base_image
+        SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+        ENV SHELL=/bin/bash
+
+        RUN <$>mirror_configure && \\
+            <$>update && \\
+            <$>install_sudo
+
+        ARG USERNAME=<$>username
+        ARG USER_UID=1000
+        ARG USER_GID=$USER_UID
+
+        RUN groupadd --gid $USER_GID $USERNAME \\
+            && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME \\
+            && echo $USERNAME ALL=\\(root\\) NOPASSWD:ALL > /etc/sudoers.d/$USERNAME \\
+            && chmod 0440 /etc/sudoers.d/$USERNAME
+
+        USER $USERNAME
+
+        WORKDIR <$>workdir
+
+        ENV HOME=<$>workdir
+
+        <$>tool_stages
+
+        # SecretsUsedInArgOrEnv: Do not use ARG or ENV instructions for sensitive data
+        ARG PASSWORD=admin
+        RUN echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
+    """)
+
+    def __init__(self, config: DevEnvironmentConfig) -> None:
+        self.config = config
+        self.tools = config.conf
+        self.docker_template = self._setup_docker_template()
+
+    def _setup_docker_template(self) -> DockerfileTemplate:
+        base_template = DockerfileTemplate(textwrap.dedent(self.DOCKERFILE_BASE_TEMPLATE).strip())
+        cfg = self.config.current_distro_config
+
+        return DockerfileTemplate(
+            base_template.safe_substitute(
+                base_image=cfg.base_image,
+                mirror_configure=cfg.mirror_config(),
+                update=cfg.pkg_update,
+                install_sudo=cfg.install_nosudo('sudo'),
+                username=self.config.username,
+                workdir='/home/$USERNAME',
+            )
+        )
+
+    def build_tool_stage(self, name: str, tool: Tool) -> str:
+        buf = io.StringIO()
+        buf.write(f'# stage: {shlex.quote(name)}\n')
+
+        if tool.env:
+            buf.write(f'# setting Env for {name}\n')
+            for env_item in tool.env:
+                for key, val in env_item.items():
+                    buf.write(f'ENV {key}={val}\n')
+            buf.write('\n')
+
+        if tool.copy:
+            buf.write(f'# file copy for {name}\n')
+            for copy_item in tool.copy:
+                buf.write(f'COPY --chown=$USERNAME:$USERNAME {copy_item["source"]} {copy_item["destination"]}\n')
+
+        if tool.setup:
+            for setup_cmd in tool.setup:
+                buf.write(f'RUN {normalize_indent_after_first_line(setup_cmd)}\n')
+            buf.write('\n')
+
+        return buf.getvalue()
+
+    def build(self) -> str:
+        stages = []
+        for name, tool in self.tools.items():
+            stages.append(self.build_tool_stage(name, tool))
+        return self.docker_template.substitute(tool_stages='\n'.join(stages))
+
+
+class SetupShBuilder:
+    def _get_header(self, profile: str, distro: str, arch: str) -> str:
+        return textwrap.dedent(f"""
+            #!/bin/bash
+            set -euo pipefail
+
+            # generated setup script for profile: {profile}
+            # distro: {distro}, arch: {arch}
+
+            RED='\\033[0;31m'
+            GREEN='\\033[0;32m'
+            YELLOW='\\033[0;33m'
+            NC='\\033[0m'
+
+            log_info() {{ echo -e "${{GREEN}}[info]${{NC}} $1"; }}
+            log_warn() {{ echo -e "${{YELLOW}}[warn]${{NC}} $1"; }}
+            log_error() {{ echo -e "${{RED}}[error]${{NC}} $1" >&2; }}
+
+            # ensure local bin directory exists
+            mkdir -p "$HOME/.local/bin"
+            export PATH="$HOME/.local/bin:$PATH"
+
+            # use temp directory for downloads
+            TMPDIR=$(mktemp -d)
+            trap "rm -rf $TMPDIR" EXIT
+            cd "$TMPDIR"
+
+            TOOLS_TO_INSTALL=()
+            INSTALL_ALL=false
+        """)
+
+    SETUP_SH_MAIN = textwrap.dedent("""
+        print_usage() {
+            echo "usage: $0 [options] [tool1 tool2 ...]"
+            echo ""
+            echo "options:"
+            echo "  --all        install all tools"
+            echo "  --list       list available tools"
+            echo "  --help       show this help"
+            echo ""
+            echo "available tools:"
+            for tool in "${!TOOL_FUNCTIONS[@]}"; do
+                echo "  $tool"
+            done | sort
+        }
+
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --all)
+                    INSTALL_ALL=true
+                    shift
+                    ;;
+                --list)
+                    echo "available tools:"
+                    for tool in "${!TOOL_FUNCTIONS[@]}"; do
+                        echo "  $tool"
+                    done | sort
+                    exit 0
+                    ;;
+                --help|-h)
+                    print_usage
+                    exit 0
+                    ;;
+                -*)
+                    log_error "unknown option: $1"
+                    print_usage
+                    exit 1
+                    ;;
+                *)
+                    TOOLS_TO_INSTALL+=("$1")
+                    shift
+                    ;;
+            esac
+        done
+
+        if [[ "$INSTALL_ALL" == true ]]; then
+            TOOLS_TO_INSTALL=("${ALL_TOOLS[@]}")
+        fi
+
+        if [[ ${#TOOLS_TO_INSTALL[@]} -eq 0 ]]; then
+            print_usage
+            exit 1
+        fi
+
+        for tool in "${TOOLS_TO_INSTALL[@]}"; do
+            if [[ -n "${TOOL_FUNCTIONS[$tool]:-}" ]]; then
+                log_info "installing $tool..."
+                eval "${TOOL_FUNCTIONS[$tool]}"
+                log_info "$tool installed"
+            else
+                log_error "unknown tool: $tool"
+                exit 1
+            fi
+        done
+
+        log_info "setup complete!"
+    """)
+
+    def __init__(self, config: DevEnvironmentConfig) -> None:
+        self.config = config
+        self.tools = config.conf
+
+    def _escape_for_bash(self, cmd: str) -> str:
+        # escape single quotes for embedding in bash single-quoted string
+        return cmd.replace("'", "'\"'\"'")
+
+    def build_tool_entry(self, name: str, tool: Tool) -> str:
+        commands = []
+        if tool.copy:
+            for f in tool.copy:
+                commands.append(f'mkdir -p $(dirname {shlex.quote(f["destination"])})')
+                commands.append(f'cp {shlex.quote(f["source"])} {shlex.quote(f["destination"])}')
+        if tool.setup:
+            for cmd in tool.setup:
+                commands.append(cmd)
+
+        if not commands:
+            commands = ['true']
+
+        combined = ' && '.join(commands)
+        escaped = self._escape_for_bash(combined)
+        return f"[{name}]='{escaped}'"
+
+    def build(self) -> str:
+        buf = io.StringIO()
+
+        # header
+        header = self._get_header(
+            profile=self.config.profile or 'unknown',
+            distro=self.config.distro,
+            arch=self.config.host_arch,
+        )
+        buf.write(header)
+
+        # tool functions as associative array
+        buf.write('\ndeclare -A TOOL_FUNCTIONS\n')
+        for name, tool in self.tools.items():
+            buf.write(f'TOOL_FUNCTIONS{self.build_tool_entry(name, tool)}\n')
+
+        # all tools array (preserves order)
+        tool_names = ' '.join(f'"{name}"' for name in self.tools.keys())
+        buf.write(f'\nALL_TOOLS=({tool_names})\n')
+
+        # main script
+        buf.write(self.SETUP_SH_MAIN)
+
+        return buf.getvalue()
+
+
+class ArtifactRepository:
+    def __init__(self, output_dir: str = '~/.dotfiles/.devenv/'):
+        self.output_dir = pathlib.Path(output_dir).expanduser().resolve()
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.logs_dir = self.output_dir / 'logs'
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.main_log_file = self.logs_dir / 'dnv.log'
+        if not self.main_log_file.exists():
+            try:
+                self.main_log_file.touch()
+            except Exception as e:
+                logger.debug(f'could not create main log file: {e}')
+
+    def save_artifact(self, content: str, filename: str) -> pathlib.Path:
+        filepath = self.output_dir / filename
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        filepath.write_text(content)
+        return filepath
+
+    def save_logs(self, log_content: str, log_name: str | None = None) -> pathlib.Path:
+        # always append to unified log file
+        section = log_name or 'section'
+        try:
+            with self.main_log_file.open('a', encoding='utf-8') as fh:
+                fh.write('\n' + ('-' * 60) + f'\n[{section.upper()}] {datetime.datetime.now().isoformat()}\n')
+                fh.write(log_content.rstrip() + '\n')
+        except Exception as e:
+            logger.error(f'failed writing logs: {e}')
+        return self.main_log_file
+
+    def get_file_write_time(self, path: pathlib.Path) -> float:
+        if not path.exists():
+            return 0.0
+        return path.stat().st_mtime
+
+
+class ImageBuilder:
+    def __init__(self, name: str, dockerfile_path: pathlib.Path, arch: str | None = None) -> None:
+        self.name = name
+        self.dockerfile_path = dockerfile_path
+        self.arch = arch
+
+    @staticmethod
+    def get_image_tag(config: DevEnvironmentConfig) -> str:
+        return f'dnv-{config.profile}-{config.distro}-{config.host_arch}:latest'
+
+    def _image_exists(self, image_name: str) -> bool:
+        return bool(
+            subprocess.run(
+                ContainerEngine.cmd('images', '-q', image_name), capture_output=True, text=True
+            ).stdout.strip()
+        )
+
+    def is_built(self) -> bool:
+        return self._image_exists(self.name)
+
+    def build(self) -> bool:
+        logger.info(f'building image: {self.name}')
+        dotfiles_dir = pathlib.Path.home() / '.dotfiles'
+
+        build_cmd = ContainerEngine.cmd(
+            'build',
+            '-t',
+            self.name,
+            '-f',
+            str(self.dockerfile_path),
+        )
+
+        if self.arch:
+            build_cmd.extend(get_docker_platform_flag(self.arch))
+
+        if logger.isEnabledFor(logging.DEBUG):
+            build_cmd.extend(['--progress=plain', '--no-cache'])
+
+        build_cmd.append(str(dotfiles_dir))
+        logger.debug(f'running: {" ".join(build_cmd)}')
+
+        artifact_repo = ArtifactRepository()
+
+        stdout_output: str
+        stderr_output: str
+        returncode: int
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.info(f'Debug mode: showing verbose {ContainerEngine.engine()} build output...')
+            debug_result = subprocess.run(build_cmd, cwd=str(dotfiles_dir))
+            returncode = debug_result.returncode
+            stdout_output = stderr_output = 'Live output shown above'
+        else:
+            text_result = subprocess.run(build_cmd, capture_output=True, text=True, cwd=str(dotfiles_dir))
+            returncode = text_result.returncode
+            stdout_output = text_result.stdout
+            stderr_output = text_result.stderr
+
+        log_content = (
+            f'Command: {" ".join(build_cmd)}\n'
+            f'Return code: {returncode}\n'
+            f'STDOUT:\n{stdout_output}\n'
+            f'STDERR:\n{stderr_output}\n'
+        )
+        artifact_repo.save_logs(log_content, log_name='docker-build')
+
+        if returncode != 0:
+            logger.error(f'failed to build image {self.name}: {stderr_output.strip()}')
+            return False
+        logger.info(f'successfully built image: {self.name}')
+
+        self._cleanup_dangling_images()
+        return True
+
+    def _cleanup_dangling_images(self) -> None:
+        try:
+            logger.debug('cleaning up dangling images...')
+            result = subprocess.run(ContainerEngine.image_prune_cmd(), capture_output=True, text=True)
+            if result.returncode == 0 and result.stdout.strip():
+                logger.info('cleaned up dangling images')
+                logger.debug(f'cleanup output: {result.stdout.strip()}')
+        except Exception as e:
+            logger.debug(f'failed to clean up dangling images: {e}')
+
+
+class DevContainerManager:
+    @staticmethod
+    def is_running(container_id: str) -> bool:
+        if not container_id:
+            return False
+        result = subprocess.run(
+            ContainerEngine.cmd('inspect', '--format', '{{.State.Running}}', container_id),
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0 and result.stdout.strip() == 'true'
+
+    @staticmethod
+    def start(image_name: str, name: str | None, docker_config: dict[str, typing.Any], arch: str | None = None) -> None:
+        cmd = ContainerEngine.cmd('run', '-it', '--label', 'devenv=true')
+
+        # Add platform flag if cross-platform run is needed
+        if arch:
+            cmd.extend(get_docker_platform_flag(arch))
+
+        if name:
+            cmd.extend(['--name', name, '--label', f'devenv.container={name}'])
+
+        for port in docker_config.get('exposed_ports', []):
+            cmd.extend(['-p', f'{port}:{port}'])
+
+        for volume in docker_config.get('volumes', []):
+            source = pathlib.Path(volume['source']).expanduser().resolve()
+            target = volume['target']
+            mode = volume.get('mode', 'rw')
+            cmd.extend(['-v', f'{source}:{target}:{mode}'])
+        cmd.append(image_name)
+        cmd.append('bash')
+        logger.info(f'starting container: {" ".join(cmd)}')
+
+        # replace the current python process with container engine - this exits Python
+        # and drops directly into the interactive container
+        os.execvp(ContainerEngine.engine(), cmd)
+
+    @staticmethod
+    def stop(container_id: str) -> bool:
+        if not container_id:
+            return False
+        result = subprocess.run(ContainerEngine.cmd('stop', container_id), capture_output=True)
+        return result.returncode == 0
+
+    @staticmethod
+    def remove(container_id: str) -> bool:
+        if not container_id:
+            return False
+        result = subprocess.run(ContainerEngine.cmd('rm', container_id), capture_output=True, text=True)
+        if result.returncode == 0:
+            logger.info(f"container '{container_id}' removed successfully")
+            return True
+        else:
+            logger.error(f"failed to remove container '{container_id}': {result.stderr.strip()}")
+            return False
+
+    @staticmethod
+    def exec_command(container_id: str, command: list[str]) -> subprocess.CompletedProcess[bytes]:
+        if not container_id:
+            raise RuntimeError('container not started')
+        return subprocess.run(ContainerEngine.cmd('exec', '-it', container_id, *command))
+
+    @staticmethod
+    def is_healthy(container_id: str) -> bool:
+        return DevContainerManager.is_running(container_id)
+
+    @staticmethod
+    def get_logs(container_id: str) -> str:
+        if not container_id:
+            return ''
+        result = subprocess.run(ContainerEngine.cmd('logs', container_id), capture_output=True, text=True)
+        return result.stdout if result.returncode == 0 else ''
+
+    @staticmethod
+    def start_existing_container(container_name: str) -> bool:
+        if not container_name:
+            return False
+        result = subprocess.run(ContainerEngine.cmd('start', container_name), capture_output=True, text=True)
+        if result.returncode == 0:
+            logger.info(f"container '{container_name}' started successfully")
+            return True
+        else:
+            logger.error(f"failed to start container '{container_name}': {result.stderr.strip()}")
+            return False
+
+    @staticmethod
+    def container_exists(container_name: str) -> bool:
+        if not container_name:
+            return False
+        result = subprocess.run(
+            ContainerEngine.cmd('inspect', '--format', '{{.State.Status}}', container_name),
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+
+    @staticmethod
+    def exec_shell(container_id: str, shell: str = '/bin/bash') -> None:
+        if not container_id:
+            logger.warning('no container ID available')
+            return
+        result = subprocess.run(ContainerEngine.cmd('exec', '-it', container_id, shell))
+        if result.returncode != 0:
+            logger.error(f"failed to login to container '{container_id}' (ensure running)")
+
+    @staticmethod
+    def remove_volumes(container_name: str) -> bool:
+        volume_result = subprocess.run(
+            ContainerEngine.cmd(
+                'volume',
+                'ls',
+                '--filter',
+                f'label=devenv.container={container_name}',
+                '-q',
+            ),
+            capture_output=True,
+            text=True,
+        )
+
+        if volume_result.stdout.strip():
+            volumes = volume_result.stdout.strip().split('\n')
+            for volume in volumes:
+                vol_del_result = subprocess.run(ContainerEngine.cmd('volume', 'rm', volume), capture_output=True)
+                if vol_del_result.returncode == 0:
+                    logger.info(f"volume '{volume}' removed")
+                else:
+                    logger.error(f"failed to remove volume '{volume}'")
+            return True
+        return False
+
+    @staticmethod
+    def list_deployments() -> None:
+        result = subprocess.run(
+            ContainerEngine.cmd(
+                'ps',
+                '-a',
+                '--filter',
+                'label=devenv=true',
+                '--format',
+                'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}',
+            ),
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode == 0:
+            logger.info('devenv deployments:')
+            for line in result.stdout.strip().splitlines():
+                logger.info(f'{line}')
+        else:
+            logger.error(f'error listing deployments: {result.stderr.strip()}')
+
+
+def get_dockerfile_name(config: DevEnvironmentConfig) -> pathlib.Path:
+    devenv_dir = pathlib.Path.home() / '.dotfiles/.devenv'
+    devenv_dir.mkdir(parents=True, exist_ok=True)
+    return devenv_dir / f'Dockerfile.{config.profile}.{config.distro}.{config.host_arch}'
+
+
+class CommandHandler:
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.artifact_repo = ArtifactRepository()
+
+    def handle_spin(self) -> None:
+        if self.args.profile not in DevEnvironmentConfig.PROFILES:
+            available = list(DevEnvironmentConfig.PROFILES.keys())
+            logger.error(f"profile '{self.args.profile}' not found. Available: {available}")
+            sys.exit(1)
+
+        config = DevEnvironmentConfig.from_profile(self.args.profile)
+        dockerfile_path = get_dockerfile_name(config)
+
+        image_name = ImageBuilder.get_image_tag(config)
+        image_builder = ImageBuilder(image_name, dockerfile_path, config.host_arch)
+
+        if self.args.rebuild:
+            logger.info(f'rebuilding image: {image_name}...')
+            self.artifact_repo.save_artifact(DockerfileBuilder(config).build(), dockerfile_path.name)
+            if not image_builder.build():
+                logger.error('failed to build image')
+                sys.exit(1)
+        elif not image_builder.is_built():
+            logger.info(f'image {image_name} not found, building...')
+            self.artifact_repo.save_artifact(DockerfileBuilder(config).build(), dockerfile_path.name)
+            if not image_builder.build():
+                logger.error('failed to build image')
+                sys.exit(1)
+        else:
+            logger.info(f'using existing image: {image_name}')
+
+        # This call will replace the current Python process with the Docker command
+        # and never return - the user will be dropped directly into the container
+        DevContainerManager.start(image_name, self.args.name, config.get_profile_data(), config.host_arch)
+
+    def handle_build(self) -> None:
+        if self.args.profile not in DevEnvironmentConfig.PROFILES:
+            available = list(DevEnvironmentConfig.PROFILES.keys())
+            logger.error(f"profile '{self.args.profile}' not found. Available: {available}")
+            sys.exit(1)
+
+        config = DevEnvironmentConfig.from_profile(self.args.profile)
+        dockerfile_path = get_dockerfile_name(config)
+        self.artifact_repo.save_artifact(DockerfileBuilder(config).build(), str(dockerfile_path))
+
+        image_builder = ImageBuilder(ImageBuilder.get_image_tag(config), dockerfile_path, config.host_arch)
+        if not image_builder.build():
+            logger.error('failed to build image')
+            sys.exit(1)
+        logger.info(f"image '{ImageBuilder.get_image_tag(config)}' built successfully")
+
+    def handle_craft(self) -> None:
+        if self.args.profile not in DevEnvironmentConfig.PROFILES:
+            available = list(DevEnvironmentConfig.PROFILES.keys())
+            logger.error(f"profile '{self.args.profile}' not found. Available: {available}")
+            sys.exit(1)
+
+        config = DevEnvironmentConfig.from_profile(self.args.profile)
+
+        # determine output format
+        output_format = self.args.format
+        if output_format is None:
+            output_format = 'shell' if config.distro == 'darwin' else 'dockerfile'
+
+        if output_format == 'shell':
+            script_content = SetupShBuilder(config).build()
+            filename = f'setup.{config.profile}.{config.distro}.{config.host_arch}.sh'
+            saved_path = self.artifact_repo.save_artifact(script_content, filename)
+            logger.info(f'setup script written to: {saved_path}')
+        else:
+            if config.distro == 'darwin':
+                logger.error('dockerfile format not supported for darwin profile')
+                sys.exit(1)
+            dockerfile_content = DockerfileBuilder(config).build()
+            filename = f'Dockerfile.{config.profile}.{config.distro}.{config.host_arch}'
+            saved_path = self.artifact_repo.save_artifact(dockerfile_content, filename)
+            logger.info(f'Dockerfile written to: {saved_path}')
+
+    def handle_ls(self) -> None:
+        DevContainerManager.list_deployments()
+
+    def handle_rm(self) -> None:
+        for name in self.args.names:
+            logger.info(f"removing container '{name}'...")
+            DevContainerManager.stop(name)
+            success = DevContainerManager.remove(name)
+
+            if success and hasattr(self.args, 'volumes') and self.args.volumes:
+                DevContainerManager.remove_volumes(name)
+
+            if not success:
+                logger.error(f"failed to remove container '{name}'")
+            else:
+                logger.info(f"successfully removed '{name}'")
+
+    def handle_shell(self) -> None:
+        container_name = self.args.name
+
+        if not container_name:
+            logger.error('container name required for shell command')
+            return
+
+        if not DevContainerManager.container_exists(container_name):
+            logger.error(f"container '{container_name}' does not exist")
+            return
+
+        if not DevContainerManager.is_running(container_name):
+            logger.info(f"container '{container_name}' not running; starting...")
+            if not DevContainerManager.start_existing_container(container_name):
+                return
+
+        time.sleep(1)
+
+        DevContainerManager.exec_shell(container_name, self.args.shell)
+
+    def handle(self) -> None:
+        match self.args.command:
+            case 'build':
+                self.handle_build()
+            case 'spin':
+                self.handle_spin()
+            case 'craft':
+                self.handle_craft()
+            case 'ls':
+                self.handle_ls()
+            case 'rm':
+                self.handle_rm()
+            case 'shell':
+                self.handle_shell()
+            case _:
+                print('command not supported')
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description='Development environment manager using containers',
+        epilog="""
+Commands:
+  spin      Build (if needed) and start an interactive container from a profile
+  build     Build container image from a profile without starting it
+  craft     Generate Dockerfile from a profile without building
+  ls        List all devenv containers (running and stopped)
+  rm        Remove one or more devenv containers
+  shell     Open a shell in an existing container
+
+Profiles:
+  workstation        Full development environment (x86_64) with Python, Node,
+                     Rust, Go, Neovim, and common CLI tools
+  workstation-arm    Same as workstation but for ARM64 architecture
+  python-minimal     Lightweight Python environment with essential tools
+  python-minimal-arm Same as python-minimal but for ARM64 architecture
+  ml-cuda            CUDA-enabled environment for machine learning
+  macos              macOS native setup (generates shell script, not Dockerfile)
+  just-dotfiles      Only dotfiles sync, no container tools
+
+Examples:
+  %(prog)s spin                                    Start workstation container
+  %(prog)s spin --profile python-minimal           Start minimal Python environment
+  %(prog)s spin --profile workstation --name dev   Start with custom container name
+  %(prog)s build --profile workstation             Build image without starting
+  %(prog)s craft --profile workstation             Generate Dockerfile only
+  %(prog)s ls                                      List all devenv containers
+  %(prog)s shell mycontainer                       Shell into existing container
+  %(prog)s rm mycontainer                          Remove a container
+  %(prog)s rm container1 container2 --volumes      Remove containers and volumes
+
+Environment:
+  DEBUG=1            Enable debug logging with file output to ~/.dotfiles/.logs/dnv/
+  CONTAINER_ENGINE   Override container engine detection (docker or podman)
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest='command', help='available commands')
+
+    # spin command args
+    spin_parser = subparsers.add_parser('spin', help='build and start interactive container')
+    spin_parser.add_argument(
+        '--profile',
+        default='workstation',
+        help='profile name to use (default: workstation)',
+    )
+    spin_parser.add_argument('--name', help='container name')
+    spin_parser.add_argument('--rebuild', action='store_true', help='force rebuild the image from a fresh Dockerfile')
+
+    # build command args
+    build_parser = subparsers.add_parser('build', help='build development environment')
+    build_parser.add_argument(
+        '--profile',
+        default='workstation',
+        help='profile name to use (default: workstation)',
+    )
+
+    # craft command args
+    craft_parser = subparsers.add_parser('craft', help='generate Dockerfile or shell script')
+    craft_parser.add_argument(
+        '--profile',
+        default='workstation',
+        help='profile name to use (default: workstation)',
+    )
+    craft_parser.add_argument(
+        '--format',
+        choices=['dockerfile', 'shell'],
+        default=None,
+        help='output format: dockerfile or shell (default: shell for darwin, dockerfile for others)',
+    )
+
+    # ls command args
+    subparsers.add_parser('ls', help='list containers')
+
+    # rm command args
+    rm_parser = subparsers.add_parser('rm', help='remove container(s)')
+    rm_parser.add_argument('names', nargs='+', help='container name(s) to remove')
+    rm_parser.add_argument('--volumes', action='store_true', help='also delete volumes')
+
+    # shell command args
+    shell_parser = subparsers.add_parser('shell', help='shell into container')
+    shell_parser.add_argument('name', help='container name')
+    shell_parser.add_argument('--shell', default='/bin/bash', help='shell to use')
+
+    args = parser.parse_args()
+
+    if args.command is None:
+        parser.print_help()
+        print('\navailable profiles:')
+        for profile_name, profile_data in DevEnvironmentConfig.PROFILES.items():
+            print(f'- {profile_name}:')
+            if 'distro' in profile_data:
+                distro = profile_data['distro']
+                if distro in DevEnvironmentConfig.DISTROS:
+                    base_image = DevEnvironmentConfig.DISTROS[distro].base_image
+                    print(f'  distro: {distro} ({base_image})')
+                else:
+                    print(f'  distro: {distro} (invalid)')
+            if 'tools' in profile_data:
+                tools = profile_data['tools']
+                print(f'  tools: {", ".join(tools)}')
+            print()
+        return
+
+    CommandHandler(args).handle()
+
+
+if __name__ == '__main__':
+    main()
