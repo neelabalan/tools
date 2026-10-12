@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bookmarks</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+    }
+
+    .url-row:hover {
+      background-color: rgba(59, 130, 246, 0.05);
+    }
+
+    .sortable {
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .sortable:hover {
+      background-color: rgba(59, 130, 246, 0.1);
+    }
+
+    table {
+      table-layout: fixed;
+      width: 100%;
+    }
+
+    .url-col {
+      width: 35%;
+      min-width: 250px;
+    }
+
+    .title-col {
+      width: 30%;
+    }
+
+    .tags-col {
+      width: 20%;
+      min-width: 120px;
+    }
+
+    .date-col {
+      width: 15%;
+      min-width: 100px;
+    }
+
+    @media (max-width: 768px) {
+      .desktop-table {
+        display: none;
+      }
+
+      .mobile-cards {
+        display: block;
+      }
+    }
+
+    @media (min-width: 769px) {
+      .desktop-table {
+        display: table;
+      }
+
+      .mobile-cards {
+        display: none;
+      }
+    }
+
+    .tag-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 500;
+      margin-right: 4px;
+      margin-bottom: 4px;
+    }
+
+    .tag-filter {
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .tag-filter:hover {
+      opacity: 0.8;
+    }
+
+    .tag-filter.active {
+      ring: 2px;
+      ring-color: rgb(59, 130, 246);
+    }
+  </style>
+</head>
+
+<body class="bg-gray-50 dark:bg-gray-900">
+  <div class="container mx-auto px-4 py-6 md:py-8 max-w-7xl">
+    <div class="bg-white dark:bg-gray-800 rounded-lg shadow-lg p-4 md:p-6">
+      <h1 class="text-2xl md:text-3xl font-bold mb-4 md:mb-6 text-gray-900 dark:text-white">Bookmarks</h1>
+      <div class="mb-4">
+        <input type="text" id="searchInput" placeholder="Search URLs and titles..."
+          class="w-full px-4 py-2 md:py-3 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 dark:bg-gray-700 dark:text-white text-base">
+      </div>
+
+      <div class="mb-4">
+        <div class="flex items-center justify-between mb-2 cursor-pointer" id="tagFilterToggle">
+          <label class="text-sm font-semibold text-gray-700 dark:text-gray-300">Filter by Tags <span id="tagFilterArrow">▼</span></label>
+          <button id="clearTagsBtn" class="text-xs text-blue-600 dark:text-blue-400 hover:underline">Clear All</button>
+        </div>
+        <div id="tagFilters" class="flex flex-wrap gap-2"></div>
+      </div>
+
+      <div class="overflow-x-auto desktop-table">
+        <table class="w-full">
+          <thead class="bg-gray-100 dark:bg-gray-700">
+            <tr>
+              <th class="sortable url-col px-4 py-3 text-left text-sm font-semibold text-gray-700 dark:text-gray-300"
+                data-sort="url">
+                URL <span class="sort-indicator"></span>
+              </th>
+              <th class="sortable title-col px-4 py-3 text-left text-sm font-semibold text-gray-700 dark:text-gray-300"
+                data-sort="title">
+                Title <span class="sort-indicator"></span>
+              </th>
+              <th class="tags-col px-4 py-3 text-left text-sm font-semibold text-gray-700 dark:text-gray-300">
+                Tags
+              </th>
+              <th class="sortable date-col px-4 py-3 text-left text-sm font-semibold text-gray-700 dark:text-gray-300"
+                data-sort="first_seen">
+                Added <span class="sort-indicator"></span>
+              </th>
+            </tr>
+          </thead>
+          <tbody id="urlTableBody"></tbody>
+        </table>
+      </div>
+
+      <div class="mobile-cards space-y-3" id="mobileCards"></div>
+
+      <div
+        class="mt-4 md:mt-6 flex flex-col md:flex-row items-center justify-between gap-3 text-sm text-gray-600 dark:text-gray-400">
+        <div id="stats"></div>
+        <div id="pagination" class="flex gap-2"></div>
+      </div>
+    </div>
+  </div>
+  <script>
+    const urlsData = {{URLS_DATA}};
+    console.log('Total URLs loaded:', urlsData.length);
+    if (urlsData.length > 0) {
+      console.log('Sample URL:', urlsData[0]);
+    }
+
+    let filteredUrls = urlsData;
+    let currentPage = 1;
+    const itemsPerPage = 50;
+    let sortColumn = 'url';
+    let sortDirection = 'asc';
+    let selectedTags = new Set();
+
+    // Extract all unique tags and their counts
+    const tagCounts = {};
+    urlsData.forEach(item => {
+      if (item.tags && Array.isArray(item.tags)) {
+        item.tags.forEach(tag => {
+          tagCounts[tag] = (tagCounts[tag] || 0) + 1;
+        });
+      }
+    });
+
+    function renderTagFilters() {
+      const container = document.getElementById('tagFilters');
+      container.innerHTML = '';
+
+      const sortedTags = Object.entries(tagCounts)
+        .sort((a, b) => a[0].localeCompare(b[0]))
+        .map(([tag]) => tag);
+
+      sortedTags.forEach(tag => {
+        const badge = document.createElement('span');
+        const isActive = selectedTags.has(tag);
+
+        badge.className = `tag-badge tag-filter ${isActive ? 'active' : ''}`;
+        badge.style.backgroundColor = isActive ? '#3b82f6' : '#f9fafb';
+        badge.style.color = isActive ? 'white' : '#6b7280';
+        badge.style.border = `2px solid ${isActive ? '#3b82f6' : '#e5e7eb'}`;
+        badge.textContent = `#${tag} (${tagCounts[tag]})`;
+        badge.onclick = () => toggleTag(tag);
+        container.appendChild(badge);
+      });
+    }
+
+    function toggleTag(tag) {
+      if (selectedTags.has(tag)) {
+        selectedTags.delete(tag);
+      } else {
+        selectedTags.add(tag);
+      }
+      renderTagFilters();
+      renderContent();
+    }
+
+    document.getElementById('clearTagsBtn').onclick = (e) => {
+      e.stopPropagation();
+      selectedTags.clear();
+      renderTagFilters();
+      renderContent();
+    };
+
+    document.getElementById('tagFilterToggle').onclick = () => {
+      const filters = document.getElementById('tagFilters');
+      const arrow = document.getElementById('tagFilterArrow');
+      if (filters.style.display === 'none') {
+        filters.style.display = 'flex';
+        arrow.textContent = '▼';
+      } else {
+        filters.style.display = 'none';
+        arrow.textContent = '▶';
+      }
+    };
+
+    function formatDate(isoString) {
+      if (!isoString) return 'N/A';
+      const date = new Date(isoString);
+      return date.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+    }
+
+    function sortData(column) {
+      if (sortColumn === column) {
+        sortDirection = sortDirection === 'asc' ? 'desc' : 'asc';
+      } else {
+        sortColumn = column;
+        sortDirection = 'asc';
+      }
+      updateSortIndicators();
+      renderContent();
+    }
+
+    function updateSortIndicators() {
+      document.querySelectorAll('.sort-indicator').forEach(el => el.textContent = '');
+      const activeHeader = document.querySelector(`[data-sort="${sortColumn}"] .sort-indicator`);
+      if (activeHeader) {
+        activeHeader.textContent = sortDirection === 'asc' ? ' ↑' : ' ↓';
+      }
+    }
+
+    function filterAndSort(resetPage = true) {
+      const searchTerm = document.getElementById('searchInput').value.toLowerCase();
+
+      filteredUrls = urlsData.filter(item => {
+        const matchesSearch = item.url.toLowerCase().includes(searchTerm) ||
+          (item.title && item.title.toLowerCase().includes(searchTerm));
+
+        const matchesTags = selectedTags.size === 0 ||
+          (item.tags && Array.from(selectedTags).every(tag => item.tags.includes(tag)));
+
+        return matchesSearch && matchesTags;
+      });
+
+      filteredUrls.sort((a, b) => {
+        let aVal = a[sortColumn] || '';
+        let bVal = b[sortColumn] || '';
+        if (typeof aVal === 'string') {
+          aVal = aVal.toLowerCase();
+          bVal = bVal.toLowerCase();
+        }
+        if (aVal < bVal) return sortDirection === 'asc' ? -1 : 1;
+        if (aVal > bVal) return sortDirection === 'asc' ? 1 : -1;
+        return 0;
+      });
+
+      if (resetPage) {
+        currentPage = 1;
+      }
+    }
+
+    function renderContent(resetPage = true) {
+      filterAndSort(resetPage);
+      console.log('Filtered URLs:', filteredUrls.length);
+      renderDesktopTable();
+      renderMobileCards();
+      renderPagination();
+      updateStats();
+    }
+
+    function renderDesktopTable() {
+      const tbody = document.getElementById('urlTableBody');
+      tbody.innerHTML = '';
+
+      const startIdx = (currentPage - 1) * itemsPerPage;
+      const endIdx = Math.min(startIdx + itemsPerPage, filteredUrls.length);
+      const pageUrls = filteredUrls.slice(startIdx, endIdx);
+
+      console.log('Rendering desktop table:', pageUrls.length, 'URLs');
+
+      pageUrls.forEach(item => {
+        const row = document.createElement('tr');
+        row.className = 'url-row border-b border-gray-200 dark:border-gray-700';
+
+        const tagsHtml = item.tags && item.tags.length > 0
+          ? item.tags.map(tag => {
+            return `<span class="tag-badge" style="background-color: #e5e7eb; color: #374151; border: 1px solid #d1d5db;">#${tag}</span>`;
+          }).join('')
+          : '<span class="text-gray-400 text-xs">No tags</span>';
+
+        row.innerHTML = `
+<td class="px-4 py-3 break-words">
+<a href="${item.url}" target="_blank" class="text-blue-600 dark:text-blue-400 hover:underline break-all text-sm">${item.url}</a>
+</td>
+<td class="px-4 py-3 text-sm text-gray-700 dark:text-gray-300 break-words">${item.title ? item.title : '<span class="text-gray-400">No title</span>'}</td>
+<td class="px-4 py-3 text-sm break-words">${tagsHtml}</td>
+<td class="px-4 py-3 text-sm text-gray-600 dark:text-gray-400 whitespace-nowrap">${formatDate(item.first_seen)}</td>
+`;
+        tbody.appendChild(row);
+      });
+    }
+
+    function renderMobileCards() {
+      const container = document.getElementById('mobileCards');
+      container.innerHTML = '';
+
+      const startIdx = (currentPage - 1) * itemsPerPage;
+      const endIdx = Math.min(startIdx + itemsPerPage, filteredUrls.length);
+      const pageUrls = filteredUrls.slice(startIdx, endIdx);
+
+      console.log('Rendering mobile cards:', pageUrls.length, 'URLs');
+
+      pageUrls.forEach(item => {
+        const card = document.createElement('div');
+        card.className = 'bg-white dark:bg-gray-700 border border-gray-200 dark:border-gray-600 rounded-lg p-4 shadow-sm';
+
+        const tagsHtml = item.tags && item.tags.length > 0
+          ? '<div class="mt-2">' + item.tags.map(tag => {
+            return `<span class="tag-badge" style="background-color: #e5e7eb; color: #374151; border: 1px solid #d1d5db;">#${tag}</span>`;
+          }).join('') + '</div>'
+          : '';
+
+        card.innerHTML = `
+<a href="${item.url}" target="_blank" class="text-blue-600 dark:text-blue-400 hover:underline break-all text-base font-medium block mb-2">${item.url}</a>
+${item.title ? `<div class="text-sm text-gray-700 dark:text-gray-300 mb-2">${item.title}</div>` : ''}
+${tagsHtml}
+<div class="text-xs text-gray-500 dark:text-gray-400 mt-2">Added: ${formatDate(item.first_seen)}</div>
+`;
+        container.appendChild(card);
+      });
+    }
+
+    function renderPagination() {
+      const totalPages = Math.ceil(filteredUrls.length / itemsPerPage);
+      const pagination = document.getElementById('pagination');
+      pagination.innerHTML = '';
+
+      if (totalPages <= 1) return;
+
+      const prevBtn = document.createElement('button');
+      prevBtn.textContent = '← Prev';
+      prevBtn.className = `px-3 py-2 rounded text-sm md:text-base ${currentPage === 1 ? 'bg-gray-200 text-gray-400 cursor-not-allowed dark:bg-gray-700' : 'bg-blue-500 text-white hover:bg-blue-600'}`;
+      prevBtn.disabled = currentPage === 1;
+      prevBtn.onclick = () => { if (currentPage > 1) { currentPage--; renderContent(false); } };
+      pagination.appendChild(prevBtn);
+
+      const pageInfo = document.createElement('span');
+      pageInfo.textContent = `Page ${currentPage} of ${totalPages}`;
+      pageInfo.className = 'px-3 py-2 text-sm md:text-base';
+      pagination.appendChild(pageInfo);
+
+      const nextBtn = document.createElement('button');
+      nextBtn.textContent = 'Next →';
+      nextBtn.className = `px-3 py-2 rounded text-sm md:text-base ${currentPage === totalPages ? 'bg-gray-200 text-gray-400 cursor-not-allowed dark:bg-gray-700' : 'bg-blue-500 text-white hover:bg-blue-600'}`;
+      nextBtn.disabled = currentPage === totalPages;
+      nextBtn.onclick = () => { if (currentPage < totalPages) { currentPage++; renderContent(false); } };
+      pagination.appendChild(nextBtn);
+    }
+
+    function updateStats() {
+      const startIdx = (currentPage - 1) * itemsPerPage + 1;
+      const endIdx = Math.min(startIdx + itemsPerPage - 1, filteredUrls.length);
+      document.getElementById('stats').textContent = filteredUrls.length > 0
+        ? `Showing ${startIdx}-${endIdx} of ${filteredUrls.length} URLs`
+        : 'No URLs found';
+    }
+
+    document.getElementById('searchInput').addEventListener('input', renderContent);
+
+    document.querySelectorAll('.sortable').forEach(header => {
+      header.addEventListener('click', () => sortData(header.dataset.sort));
+    });
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === '/' && document.activeElement.tagName !== 'INPUT') {
+        e.preventDefault();
+        document.getElementById('searchInput').focus();
+      }
+      if (e.key === 'Escape') {
+        document.getElementById('searchInput').value = '';
+        selectedTags.clear();
+        renderTagFilters();
+        renderContent();
+      }
+    });
+
+    renderTagFilters();
+    updateSortIndicators();
+    renderContent();
+    console.log('Initial render complete');
+  </script>
+</body>
+
+</html>

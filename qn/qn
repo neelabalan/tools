@@ -1,0 +1,283 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+#
+
+# core: notes lifecycle, config and plugin loading only. stdlib-only, not thirdy-party deps.
+# self-contained on purpose: utils are duplicated between qn and plugins/_utils.py so qn stays
+# a single script runnable anywhere with python >= 3.11. keep both copies in sync manually.
+import argparse
+import datetime
+import importlib.util
+import json
+import pathlib
+import shutil
+import subprocess
+import sys
+import types
+import uuid
+
+SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+CONFIG_PATH = SCRIPT_DIR / '.qn.json'
+PLUGINS_PATH = SCRIPT_DIR / 'plugins'
+
+DEFAULT_CONFIG = {
+    'notes_dir': '~/notes',
+    'editor': 'vim',
+}
+
+
+def load_config() -> dict[str, str]:
+    if not CONFIG_PATH.exists():
+        return dict(DEFAULT_CONFIG)
+
+    try:
+        with open(CONFIG_PATH) as f:
+            config = json.load(f)
+        return {**DEFAULT_CONFIG, **config}
+    except (json.JSONDecodeError, OSError) as ex:
+        print(f'> {ex}')
+        return dict(DEFAULT_CONFIG)
+
+
+def save_config(config: dict[str, str]) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(CONFIG_PATH, 'w') as f:
+        json.dump(config, f, indent=4)
+    CONFIG_PATH.chmod(0o600)
+
+
+def expand_path(path_str: str) -> pathlib.Path:
+    if not path_str or '..' in path_str:
+        raise ValueError(f'invalid path: {path_str}')
+    return pathlib.Path(path_str).expanduser().resolve()
+
+
+def get_notes_dir() -> pathlib.Path:
+    notes_dir = expand_path(load_config()['notes_dir'])
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    return notes_dir
+
+
+def open_in_editor(file_path: pathlib.Path, also_open_directory: bool = False) -> None:
+    config = load_config()
+    editor = config['editor']
+    if not editor or ';' in editor or '&' in editor or '|' in editor or '$(' in editor or '`' in editor:
+        print(f'invalid editor command: {editor}')
+        sys.exit(1)
+
+    if also_open_directory:
+        notes_dir = get_notes_dir()
+        try:
+            subprocess.run([editor, str(notes_dir), str(file_path)], check=True)
+            return
+        except subprocess.CalledProcessError:
+            pass
+        except FileNotFoundError:
+            print(f"editor '{editor}' not found")
+            sys.exit(1)
+
+    try:
+        subprocess.run([editor, str(file_path)], check=True)
+    except subprocess.CalledProcessError:
+        print(f'failed to open {file_path} with {editor}')
+        sys.exit(1)
+    except FileNotFoundError:
+        print(f"editor '{editor}' not found")
+        sys.exit(1)
+
+
+def prompt_config_value(prompt_text: str, default_value: str) -> str:
+    user_input = input(f'{prompt_text} [{default_value}]: ').strip()
+    return user_input if user_input else default_value
+
+def initialize_config() -> None:
+    if CONFIG_PATH.exists():
+        response = input(f'config file already exists at {CONFIG_PATH}. overwrite? (y/N): ')
+        if response.lower() != 'y':
+            return
+    print('intializing quick notes configuration...')
+    print('press ENTER to use default value show in brackets')
+
+    notes_dir = prompt_config_value('notes directory', DEFAULT_CONFIG['notes_dir'])
+    editor = prompt_config_value('editor', DEFAULT_CONFIG['editor'])
+
+    save_config({'notes_dir': notes_dir, 'editor': editor})
+    print(f'\nconfig saved at {CONFIG_PATH}')
+
+    notes_dir_path = expand_path(notes_dir).mkdir(parents=True, exist_ok=True)
+    print(f'notes directory created at {notes_dir}')
+
+def _import_plugin(plugin_file: pathlib.Path) -> types.ModuleType:
+    plugins_dir = str(PLUGINS_PATH)
+    if plugins_dir not in sys.path:
+        sys.path.insert(0, plugins_dir)
+
+    spec = importlib.util.spec_from_file_location(f'qn_plugin_{plugin_file.stem}', plugin_file)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_plugins() -> list[dict]:
+    """
+    discover plugins: every plugin is a single .py file in .qn/plugins/ exposing `register(parser)`
+    and `run(ctx)`. files starting with "_" are shared helper modules, not plugins.
+
+    qn imports each plugin in-process just to call register() and build its real argparse tree
+    (plugins stay stdlib-only at import time, so this is cheap and safe). The actual work always
+    runs isolated via `uv run --script` (uv resolves/caches an environment per dependency set),
+    which gets a plain ctx dict piped in as JSON on stdin: {config, config_path, notes_dir,
+    plugins_dir, editor, timestamp_format, args}.
+
+    shared behavior lives in plugins/_utils.py (ctx-taking helpers); plugins do
+    `from _utils import ...`. prefer ctx data over code: anything stateless should come from ctx.
+    """
+    if not PLUGINS_PATH.is_dir():
+        return []
+
+    plugins = []
+    for plugin_file in sorted(PLUGINS_PATH.glob('*.py')):
+        if plugin_file.name.startswith('_'):
+            continue
+        module = _import_plugin(plugin_file)
+        help_text = (module.__doc__ or '').strip().splitlines()[0] if module.__doc__ else f'{plugin_file.stem} plugin'
+        plugins.append({'name': plugin_file.stem, 'help': help_text, 'file': plugin_file, 'module': module})
+    return plugins
+
+
+def build_ctx(args: dict) -> dict:
+    config = load_config()
+    return {
+        'config': config,
+        'config_path': str(CONFIG_PATH),
+        'notes_dir': str(get_notes_dir()),
+        'plugins_dir': str(PLUGINS_PATH),
+        'editor': config['editor'],
+        'timestamp_format': '%Y-%m-%d %H:%M:%S',
+        'args': args,
+    }
+
+
+def run_plugin(plugin: dict, args: dict) -> int:
+    if shutil.which('uv') is None:
+        print(f'error: plugin "{plugin["name"]}" requires uv but uv is not installed')
+        return 1
+
+    ctx = build_ctx(args)
+    try:
+        proc = subprocess.run(
+            ['uv', 'run', '--quiet', '--script', str(plugin['file'])],
+            input=json.dumps(ctx),
+            text=True,
+        )
+    except OSError as ex:
+        print(f'failed to run plugin "{plugin["name"]}": {ex}')
+        return 1
+    return proc.returncode
+
+
+def create_note() -> None:
+    notes_dir = get_notes_dir()
+    hex_id = uuid.uuid4().hex[:8]
+    note_path = notes_dir / f'{hex_id}.md'
+
+    note_path.touch()
+    open_in_editor(note_path, also_open_directory=True)
+
+
+def append_to_note(text: str) -> None:
+    config = load_config()
+    notes_dir = get_notes_dir()
+    append_file = notes_dir / config['append_note']
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    entry = f'\n### {timestamp}\n\n{text}\n\n'
+
+    if not append_file.exists():
+        append_file.write_text(f'# {config["append_note"]}\n')
+    with open(append_file, 'a') as f:
+        f.write(entry)
+    print(f'appended to {append_file}')
+
+
+def prune_empty_files() -> None:
+    notes_dir = get_notes_dir()
+    if not notes_dir.exists():
+        print('notes directory does not exist')
+        return
+
+    empty_files = []
+    for file_path in notes_dir.rglob('*.md'):
+        try:
+            if file_path.stat().st_size == 0:
+                empty_files.append(file_path)
+            else:
+                content = file_path.read_text(encoding='utf-8', errors='ignore')
+                if not content.strip():
+                    empty_files.append(file_path)
+        except OSError:
+            continue
+
+    if not empty_files:
+        print('no empty files found')
+        return
+
+    removed_count = 0
+    for file_path in empty_files:
+        try:
+            file_path.unlink()
+            print(f'removed: {file_path}')
+            removed_count += 1
+        except OSError as e:
+            print(f'failed to remove {file_path}: {e}')
+
+    print(f'successfully removed {removed_count} empty file(s)')
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description='Quick Notes CLI')
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+
+    subparsers.add_parser('open', aliases=['o'], help='Open notes directory')
+    subparsers.add_parser('init', help='Initialize configuration')
+
+    subparsers.add_parser('prune', help='Remove empty note files')
+
+    append_parser = subparsers.add_parser('append', aliases=['a'], help='Append text to note')
+    append_parser.add_argument('text', nargs='+', help='Text to append')
+
+    plugins = load_plugins()
+    plugin_map = {}
+    for plugin in plugins:
+        plugin_subparser = subparsers.add_parser(plugin['name'], help=plugin['help'])
+        plugin['module'].register(plugin_subparser)
+        plugin_map[plugin['name']] = plugin
+
+    args = parser.parse_args()
+
+    plugin = plugin_map.get(args.command)
+    if plugin:
+        parsed_args = vars(args)
+        parsed_args.pop('command', None)
+        sys.exit(run_plugin(plugin, parsed_args))
+    elif args.command in ['open', 'o']:
+        open_in_editor(get_notes_dir())
+    elif args.command == 'prune':
+        prune_empty_files()
+    elif args.command == 'init':
+        initialize_config()
+    elif args.command in ['append', 'a']:
+        text = ' '.join(args.text)
+        append_to_note(text)
+    else:
+        create_note()
+
+
+if __name__ == '__main__':
+    if sys.version_info < (3, 11):
+        print('error: this script requires Python 3.11 or later')
+        sys.exit(1)
+    main()
