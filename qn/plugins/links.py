@@ -40,7 +40,7 @@ class LinkManager:
     def __init__(self, notes_dir: pathlib.Path, max_workers: int = 10):
         self.notes_dir = notes_dir
         self.max_workers = max_workers
-        self.db_path = pathlib.Path.home() / '.config/qn/' / '.qn.db'
+        self.db_path = pathlib.Path.home() / '.config/qn/qn.db'
         self._init_db()
 
     def _init_db(self) -> None:

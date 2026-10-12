@@ -19,7 +19,7 @@ import types
 import uuid
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
-CONFIG_PATH = SCRIPT_DIR / '.qn.json'
+CONFIG_PATH = pathlib.Path.home() / '.config/qn/qn.json'
 PLUGINS_PATH = SCRIPT_DIR / 'plugins'
 
 DEFAULT_CONFIG = {
