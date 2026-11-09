@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+import argparse
+import dataclasses
+import datetime
+import json
+import pathlib
+import platform
+import shutil
+import sqlite3
+import struct
+import sys
+import tempfile
+import typing
+
+
+@dataclasses.dataclass(frozen=True)
+class HistoryEntry:
+    url: str
+    title: str
+    visit_count: int
+    last_visit_time: str
+
+
+@dataclasses.dataclass(frozen=True)
+class BookmarkEntry:
+    name: str
+    url: str
+    date_added: str
+    folder_path: str
+
+
+def get_vivaldi_profile_path() -> pathlib.Path:
+    system = platform.system()
+    home = pathlib.Path.home()
+
+    if system == "Darwin":
+        return home / "Library" / "Application Support" / "Vivaldi" / "Default"
+    elif system == "Linux":
+        # check snap installation first
+        snap_path = home / "snap" / "vivaldi" / "current" / ".config" / "vivaldi" / "Default"
+        if snap_path.exists():
+            return snap_path
+        # check flatpak installation
+        flatpak_path = home / ".var" / "app" / "com.vivaldi.Vivaldi" / "config" / "vivaldi" / "Default"
+        if flatpak_path.exists():
+            return flatpak_path
+        # standard linux path
+        return home / ".config" / "vivaldi" / "Default"
+    else:
+        # windows fallback (not fully tested)
+        return home / "AppData" / "Local" / "Vivaldi" / "User Data" / "Default"
+
+
+def chromium_timestamp_to_iso(timestamp: int) -> str:
+    # chromium timestamps are microseconds since 1601-01-01
+    if timestamp == 0:
+        return ""
+    epoch_diff = 11644473600
+    unix_timestamp = (timestamp / 1_000_000) - epoch_diff
+    try:
+        return datetime.datetime.fromtimestamp(unix_timestamp, tz=datetime.timezone.utc).isoformat()
+    except (OSError, ValueError):
+        return ""
+
+
+def ms_timestamp_to_iso(timestamp: float) -> str:
+    # vivaldi session timestamps are milliseconds since unix epoch
+    if timestamp == 0:
+        return ""
+    try:
+        unix_timestamp = timestamp / 1000
+        return datetime.datetime.fromtimestamp(unix_timestamp, tz=datetime.timezone.utc).isoformat()
+    except (OSError, ValueError):
+        return ""
+
+
+def export_history(profile_path: pathlib.Path) -> list[dict[str, typing.Any]]:
+    history_db = profile_path / "History"
+    if not history_db.exists():
+        print(f"history database not found at {history_db}", file=sys.stderr)
+        return []
+
+    # copy database to temp location to avoid locking issues
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        tmp_path = pathlib.Path(tmp.name)
+
+    shutil.copy2(history_db, tmp_path)
+
+    entries: list[dict[str, typing.Any]] = []
+    try:
+        conn = sqlite3.connect(tmp_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT url, title, visit_count, last_visit_time
+            FROM urls
+            ORDER BY last_visit_time DESC
+        """)
+
+        for row in cursor.fetchall():
+            entry = HistoryEntry(
+                url=row[0] or "",
+                title=row[1] or "",
+                visit_count=row[2] or 0,
+                last_visit_time=chromium_timestamp_to_iso(row[3] or 0),
+            )
+            entries.append(dataclasses.asdict(entry))
+
+        conn.close()
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    return entries
+
+
+def parse_bookmarks_folder(
+    node: dict[str, typing.Any],
+    folder_path: str = "",
+) -> list[dict[str, typing.Any]]:
+    entries: list[dict[str, typing.Any]] = []
+    node_type = node.get("type", "")
+    name = node.get("name", "")
+
+    if node_type == "url":
+        entry = BookmarkEntry(
+            name=name,
+            url=node.get("url", ""),
+            date_added=chromium_timestamp_to_iso(int(node.get("date_added", "0"))),
+            folder_path=folder_path,
+        )
+        entries.append(dataclasses.asdict(entry))
+    elif node_type == "folder":
+        current_path = f"{folder_path}/{name}" if folder_path else name
+        for child in node.get("children", []):
+            entries.extend(parse_bookmarks_folder(child, current_path))
+
+    return entries
+
+
+def export_bookmarks(profile_path: pathlib.Path) -> list[dict[str, typing.Any]]:
+    bookmarks_file = profile_path / "Bookmarks"
+    if not bookmarks_file.exists():
+        print(f"bookmarks file not found at {bookmarks_file}", file=sys.stderr)
+        return []
+
+    data = json.loads(bookmarks_file.read_text(encoding="utf-8"))
+    roots = data.get("roots", {})
+
+    entries: list[dict[str, typing.Any]] = []
+    for root_name, root_node in roots.items():
+        if isinstance(root_node, dict):
+            entries.extend(parse_bookmarks_folder(root_node, root_name))
+
+    return entries
+
+
+@dataclasses.dataclass(frozen=True)
+class SavedSession:
+    title: str
+    filename: str
+    tabs_count: int
+    windows_count: int
+    create_time: str
+    urls: list[str]
+
+
+def parse_snss_session(file_path: pathlib.Path) -> list[str]:
+    # parse SNSS (Session Saver) binary format used by Chromium/Vivaldi
+    if not file_path.exists():
+        return []
+
+    try:
+        data = file_path.read_bytes()
+    except Exception as e:
+        print(f"error reading session file {file_path}: {e}", file=sys.stderr)
+        return []
+
+    if data[:4] != b"SNSS":
+        return []
+
+    pos = 8
+    tab_navs: dict[int, dict[int, str]] = {}
+    selected_idx: dict[int, int] = {}
+
+    while pos < len(data) - 3:
+        size = struct.unpack("<H", data[pos:pos+2])[0]
+        if size == 0 or pos + 2 + size > len(data):
+            break
+        cmd_id = data[pos+2]
+        cmd_data = data[pos+3:pos+2+size]
+
+        if cmd_id == 6 and len(cmd_data) > 16:
+            # command 6: navigation entry
+            # bytes 4-8: tab_id, bytes 8-12: nav_index, bytes 12-16: url_len
+            tab_id = struct.unpack("<I", cmd_data[4:8])[0]
+            nav_idx = struct.unpack("<I", cmd_data[8:12])[0]
+            url_len = struct.unpack("<I", cmd_data[12:16])[0]
+            url = cmd_data[16:16+url_len].decode("utf-8", errors="ignore")
+
+            if tab_id not in tab_navs:
+                tab_navs[tab_id] = {}
+            tab_navs[tab_id][nav_idx] = url
+
+        elif cmd_id == 7 and len(cmd_data) >= 8:
+            # command 7: selected navigation index per tab
+            tab_id = struct.unpack("<I", cmd_data[0:4])[0]
+            idx = struct.unpack("<I", cmd_data[4:8])[0]
+            selected_idx[tab_id] = idx
+
+        pos += 2 + size
+
+    # extract current url for each tab
+    urls: list[str] = []
+    for tab_id in sorted(tab_navs.keys()):
+        navs = tab_navs[tab_id]
+        if not navs:
+            continue
+        sel = selected_idx.get(tab_id, max(navs.keys()))
+        current_url = navs.get(sel, list(navs.values())[-1])
+        if current_url and not current_url.startswith("chrome://"):
+            urls.append(current_url)
+
+    return urls
+
+
+def export_saved_sessions(profile_path: pathlib.Path) -> list[dict[str, typing.Any]]:
+    sessions_dir = profile_path / "Sessions"
+    sessions_json = sessions_dir / "sessions.json"
+
+    if not sessions_json.exists():
+        return []
+
+    try:
+        sessions_meta = json.loads(sessions_json.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"error reading sessions.json: {e}", file=sys.stderr)
+        return []
+
+    saved_sessions: list[dict[str, typing.Any]] = []
+
+    def process_session_node(node: dict[str, typing.Any]) -> None:
+        if node.get("type") == 0 and "filename" in node:
+            bin_file = sessions_dir / node["filename"]
+            urls = parse_snss_session(bin_file)
+            create_time = node.get("createtime", 0)
+            session = SavedSession(
+                title=node.get("title", ""),
+                filename=node.get("filename", ""),
+                tabs_count=node.get("tabscount", 0),
+                windows_count=node.get("windowscount", 0),
+                create_time=ms_timestamp_to_iso(create_time) if create_time else "",
+                urls=urls,
+            )
+            saved_sessions.append(dataclasses.asdict(session))
+
+        for child in node.get("children", []):
+            process_session_node(child)
+
+    for root in sessions_meta:
+        process_session_node(root)
+
+    return saved_sessions
+
+
+def export_autosave_sessions(profile_path: pathlib.Path) -> list[dict[str, typing.Any]]:
+    sessions_dir = profile_path / "Sessions"
+    if not sessions_dir.exists():
+        return []
+
+    autosave_sessions: list[dict[str, typing.Any]] = []
+
+    # find Session_* and Tabs_* files (autosave/current sessions)
+    for pattern in ["Session_*", "Tabs_*"]:
+        for file_path in sessions_dir.glob(pattern):
+            urls = parse_snss_session(file_path)
+            if urls:
+                autosave_sessions.append({
+                    "filename": file_path.name,
+                    "type": "session" if file_path.name.startswith("Session_") else "tabs",
+                    "modified_time": datetime.datetime.fromtimestamp(
+                        file_path.stat().st_mtime,
+                        tz=datetime.timezone.utc,
+                    ).isoformat(),
+                    "urls": urls,
+                })
+
+    return autosave_sessions
+
+
+def export_sessions(profile_path: pathlib.Path) -> dict[str, typing.Any]:
+    return {
+        "saved_sessions": export_saved_sessions(profile_path),
+        "autosave_sessions": export_autosave_sessions(profile_path),
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="export vivaldi browser data to json")
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=pathlib.Path,
+        default=pathlib.Path("vivaldi_export.json"),
+        help="output json file path (default: vivaldi_export.json)",
+    )
+    parser.add_argument(
+        "-p",
+        "--profile",
+        type=pathlib.Path,
+        default=None,
+        help="vivaldi profile path (default: auto-detect)",
+    )
+    parser.add_argument(
+        "--history-only",
+        action="store_true",
+        help="export only history",
+    )
+    parser.add_argument(
+        "--bookmarks-only",
+        action="store_true",
+        help="export only bookmarks",
+    )
+    parser.add_argument(
+        "--sessions-only",
+        action="store_true",
+        help="export only sessions",
+    )
+    args = parser.parse_args()
+
+    profile_path = args.profile or get_vivaldi_profile_path()
+    if not profile_path.exists():
+        print(f"vivaldi profile not found at {profile_path}", file=sys.stderr)
+        return 1
+
+    export_all = not (args.history_only or args.bookmarks_only or args.sessions_only)
+
+    export_data: dict[str, typing.Any] = {
+        "exported_at": datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
+        "profile_path": str(profile_path),
+    }
+
+    if export_all or args.history_only:
+        print("exporting history...")
+        export_data["history"] = export_history(profile_path)
+        print(f"  found {len(export_data['history'])} history entries")
+
+    if export_all or args.bookmarks_only:
+        print("exporting bookmarks...")
+        export_data["bookmarks"] = export_bookmarks(profile_path)
+        print(f"  found {len(export_data['bookmarks'])} bookmarks")
+
+    if export_all or args.sessions_only:
+        print("exporting sessions...")
+        export_data["sessions"] = export_sessions(profile_path)
+        saved_count = len(export_data["sessions"].get("saved_sessions", []))
+        autosave_count = len(export_data["sessions"].get("autosave_sessions", []))
+        print(f"  found {saved_count} saved sessions, {autosave_count} autosave sessions")
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(export_data, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"exported to {args.output}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

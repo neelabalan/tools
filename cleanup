@@ -1,0 +1,486 @@
+#!/usr/bin/env python3
+
+import abc
+import argparse
+import dataclasses
+import datetime
+import logging
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import typing
+
+
+class CleanupItem(abc.ABC):
+    name: str
+    description: str
+
+    @property
+    def size(self) -> int | None:
+        return None
+
+    @abc.abstractmethod
+    def clean(self, dry_run: bool = False) -> bool:
+        pass
+
+
+class PathCleanupItem(CleanupItem):
+    def __init__(self, path: pathlib.Path, description: str):
+        self.path = path
+        self.name = str(path)
+        self.description = description
+        self._cached_size: int | None = None
+
+    @property
+    def size(self) -> int | None:
+        if self._cached_size is None:
+            self._cached_size = get_folder_size(self.path) if self.path.exists() else 0
+        return self._cached_size
+
+    def clean(self, dry_run: bool = False) -> bool:
+        if dry_run:
+            return True
+        try:
+            shutil.rmtree(self.path)
+            return True
+        except FileNotFoundError:
+            return True
+
+
+class CommandCleanupItem(CleanupItem):
+    def __init__(self, name: str, description: str, command: list[str]):
+        self.name = name
+        self.description = description
+        self.command = command
+
+    def clean(self, dry_run: bool = False) -> bool:
+        if dry_run:
+            return True
+        result = subprocess.run(self.command, capture_output=True, text=True)
+        if result.returncode == 0:
+            if result.stdout.strip():
+                logger.info(f'  {result.stdout.strip()}')
+            return True
+        logger.error(f'  {result.stderr.strip()}')
+        return False
+
+
+@dataclasses.dataclass
+class CleanupResult:
+    success_count: int = 0
+    failure_count: int = 0
+    size_freed: int = 0
+    errors: list[str] = dataclasses.field(default_factory=list)
+
+
+class Cleaner(abc.ABC):
+    registry: dict[str, type['Cleaner']] = {}
+    name: str = ''
+
+    def __init_subclass__(cls, name: str | None = None, **kwargs: typing.Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if name:
+            cls.name = name
+            cls.registry[name] = cls
+
+    def __init__(self, dry_run: bool = False, auto_confirm: bool = False):
+        self.dry_run = dry_run
+        self.auto_confirm = auto_confirm
+
+    @abc.abstractmethod
+    def scan(self) -> list[CleanupItem]:
+        pass
+
+    def can_handle(self) -> bool:
+        return True
+
+    def execute(self) -> CleanupResult:
+        if not self.can_handle():
+            return CleanupResult()
+
+        items = self.scan()
+        if not items:
+            logger.info(f'{self.name}: nothing to clean')
+            return CleanupResult()
+
+        path_items = [i for i in items if isinstance(i, PathCleanupItem)]
+        command_items = [i for i in items if isinstance(i, CommandCleanupItem)]
+        total_size = sum(i.size or 0 for i in path_items)
+
+        size_summary = format_size(total_size) if path_items else ''
+        if command_items:
+            size_summary += f'{" + " if size_summary else ""}{len(command_items)} command(s)'
+        logger.info(f'{self.name}: found {len(items)} items ({size_summary})')
+
+        for item in items:
+            size_str = f' ({format_size(item.size)})' if item.size is not None else ''
+            logger.info(f'  {item.name}{size_str} - {item.description}')
+
+        if not self.auto_confirm and not confirm_action(f'Clean {len(items)} items?'):
+            return CleanupResult()
+
+        if self.dry_run:
+            logger.info('DRY RUN: skipping actual cleanup')
+            return CleanupResult(success_count=len(items), size_freed=total_size)
+
+        result = CleanupResult()
+        for item in items:
+            try:
+                if item.clean(dry_run=self.dry_run):
+                    result.success_count += 1
+                    if item.size is not None:
+                        result.size_freed += item.size
+                else:
+                    result.failure_count += 1
+            except Exception as e:
+                logger.error(f'  Failed to clean {item.name}: {e}')
+                result.errors.append(f'{item.name}: {e}')
+                result.failure_count += 1
+
+        return result
+
+
+class PathScanMixin:
+    base_path: pathlib.Path
+
+    def _should_skip_path(self, path: pathlib.Path) -> bool:
+        skip_dirs = {'node_modules', '.git', 'vendor', 'site-packages'}
+        return any(part in skip_dirs for part in path.parts[:-1])
+
+    def _scan_patterns(self, patterns: dict[str, str]) -> list[PathCleanupItem]:
+        items = []
+        for pattern, desc in patterns.items():
+            for path in self.base_path.rglob(pattern):
+                if path.is_dir() and not self._should_skip_path(path):
+                    items.append(PathCleanupItem(path, desc))
+        return items
+
+
+class PythonCleaner(Cleaner, PathScanMixin, name='python'):
+    def __init__(self, base_path: pathlib.Path, dry_run: bool = False, auto_confirm: bool = False):
+        super().__init__(dry_run, auto_confirm)
+        self.base_path = base_path
+
+    def can_handle(self) -> bool:
+        indicators = ['requirements.txt', 'setup.py', 'pyproject.toml', 'Pipfile']
+        return any((self.base_path / f).exists() for f in indicators) or bool(list(self.base_path.rglob('*.py')))
+
+    def scan(self) -> list[CleanupItem]:
+        items: list[CleanupItem] = []
+
+        patterns = {
+            '__pycache__': 'bytecode cache',
+            '.pytest_cache': 'pytest cache',
+            '.mypy_cache': 'mypy cache',
+            '.ruff_cache': 'ruff cache',
+        }
+        items.extend(self._scan_patterns(patterns))
+
+        for venv_name in ['.venv', 'venv', '.virtualenv', 'env']:
+            for path in self.base_path.rglob(venv_name):
+                if path.is_dir() and (path / 'pyvenv.cfg').exists() and not self._should_skip_path(path):
+                    items.append(PathCleanupItem(path, 'virtual environment'))
+
+        for path in self.base_path.rglob('*.egg-info'):
+            if path.is_dir() and not self._should_skip_path(path):
+                items.append(PathCleanupItem(path, 'egg metadata'))
+
+        if shutil.which('pip'):
+            items.append(
+                CommandCleanupItem(name='pip cache', description='package cache', command=['pip', 'cache', 'purge'])
+            )
+        if shutil.which('uv'):
+            items.append(
+                CommandCleanupItem(name='uv cache', description='package cache', command=['uv', 'cache', 'clean'])
+            )
+
+        return items
+
+
+class NodeCleaner(Cleaner, PathScanMixin, name='node'):
+    def __init__(self, base_path: pathlib.Path, dry_run: bool = False, auto_confirm: bool = False):
+        super().__init__(dry_run, auto_confirm)
+        self.base_path = base_path
+
+    def can_handle(self) -> bool:
+        return (self.base_path / 'package.json').exists()
+
+    def scan(self) -> list[CleanupItem]:
+        items: list[CleanupItem] = []
+
+        for path in self.base_path.rglob('node_modules'):
+            if path.is_dir() and (path.parent / 'package.json').exists() and not self._should_skip_path(path):
+                items.append(PathCleanupItem(path, 'dependencies'))
+
+        for folder in ['dist', 'build', '.next', '.nuxt']:
+            for path in self.base_path.rglob(folder):
+                if path.is_dir() and (path.parent / 'package.json').exists() and not self._should_skip_path(path):
+                    items.append(PathCleanupItem(path, 'build output'))
+
+        if shutil.which('npm'):
+            items.append(
+                CommandCleanupItem(
+                    name='npm cache', description='package cache', command=['npm', 'cache', 'clean', '--force']
+                )
+            )
+
+        return items
+
+
+class RustCleaner(Cleaner, PathScanMixin, name='rust'):
+    def __init__(self, base_path: pathlib.Path, dry_run: bool = False, auto_confirm: bool = False):
+        super().__init__(dry_run, auto_confirm)
+        self.base_path = base_path
+
+    def can_handle(self) -> bool:
+        return (self.base_path / 'Cargo.toml').exists()
+
+    def scan(self) -> list[CleanupItem]:
+        items: list[CleanupItem] = []
+        for path in self.base_path.rglob('target'):
+            if path.is_dir() and (path.parent / 'Cargo.toml').exists() and not self._should_skip_path(path):
+                items.append(PathCleanupItem(path, 'build artifacts'))
+        return items
+
+
+class DockerCleaner(Cleaner, name='docker'):
+    ALL_TYPES = ['containers', 'images', 'volumes', 'networks', 'cache']
+
+    def __init__(self, dry_run: bool = False, auto_confirm: bool = False, types: list[str] | None = None):
+        super().__init__(dry_run, auto_confirm)
+        self.types = [t for t in (types or self.ALL_TYPES) if t in self.ALL_TYPES]
+
+    def can_handle(self) -> bool:
+        return shutil.which('docker') is not None
+
+    def scan(self) -> list[CleanupItem]:
+        commands = {
+            'containers': (['docker', 'container', 'prune', '-f'], 'stopped containers'),
+            'images': (['docker', 'image', 'prune', '-a', '-f'], 'unused images'),
+            'volumes': (['docker', 'volume', 'prune', '-f'], 'unused volumes'),
+            'networks': (['docker', 'network', 'prune', '-f'], 'unused networks'),
+            'cache': (['docker', 'buildx', 'prune', '-f'], 'build cache'),
+        }
+        return [
+            CommandCleanupItem(name=t, description=desc, command=cmd)
+            for t, (cmd, desc) in commands.items()
+            if t in self.types
+        ]
+
+
+class PodmanCleaner(Cleaner, name='podman'):
+    ALL_TYPES = ['containers', 'images', 'volumes']
+
+    def __init__(self, dry_run: bool = False, auto_confirm: bool = False, types: list[str] | None = None):
+        super().__init__(dry_run, auto_confirm)
+        self.types = [t for t in (types or self.ALL_TYPES) if t in self.ALL_TYPES]
+
+    def can_handle(self) -> bool:
+        return shutil.which('podman') is not None
+
+    def scan(self) -> list[CleanupItem]:
+        commands = {
+            'containers': (['podman', 'container', 'prune', '-f'], 'stopped containers'),
+            'images': (['podman', 'image', 'prune', '-a', '-f'], 'unused images'),
+            'volumes': (['podman', 'volume', 'prune', '-f'], 'unused volumes'),
+        }
+        return [
+            CommandCleanupItem(name=t, description=desc, command=cmd)
+            for t, (cmd, desc) in commands.items()
+            if t in self.types
+        ]
+
+
+class BrewCleaner(Cleaner, name='brew'):
+    def __init__(self, dry_run: bool = False, auto_confirm: bool = False, types: list[str] | None = None):
+        super().__init__(dry_run, auto_confirm)
+
+    def can_handle(self) -> bool:
+        return shutil.which('brew') is not None
+
+    def scan(self) -> list[CleanupItem]:
+        return [
+            CommandCleanupItem(
+                name='brew', description='cache and old versions', command=['brew', 'cleanup', '--prune=all']
+            )
+        ]
+
+
+def _init_logger() -> logging.Logger:
+    debug_enabled = os.environ.get('DEBUG', '').lower() in ('1', 'true')
+    level = logging.DEBUG if debug_enabled else logging.INFO
+
+    _logger = logging.getLogger('cleanup')
+    if _logger.handlers:
+        return _logger
+
+    _logger.setLevel(level)
+    _logger.propagate = False
+    fmt = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(fmt)
+    console_handler.setLevel(level)
+    _logger.addHandler(console_handler)
+
+    if debug_enabled:
+        log_dir = pathlib.Path.home() / '.dotfiles' / '.logs' / 'cleanup'
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f'cleanup_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        file_handler.setFormatter(fmt)
+        file_handler.setLevel(level)
+        _logger.addHandler(file_handler)
+        _logger.debug('logger initialized (level=%s) file=%s', logging.getLevelName(level), log_file)
+
+    return _logger
+
+
+logger = _init_logger()
+
+
+def get_folder_size(folder_path: pathlib.Path) -> int:
+    total_size = 0
+    try:
+        for dirpath, _, filenames in os.walk(folder_path, followlinks=False):
+            for filename in filenames:
+                file_path = pathlib.Path(dirpath) / filename
+                try:
+                    total_size += file_path.lstat().st_size
+                except (OSError, FileNotFoundError):
+                    pass
+    except (OSError, PermissionError):
+        pass
+    return total_size
+
+
+def format_size(size_bytes: int) -> str:
+    size = float(size_bytes)
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size < 1024.0:
+            return f'{size:.1f} {unit}'
+        size /= 1024.0
+    return f'{size:.1f} TB'
+
+
+def confirm_action(prompt: str) -> bool:
+    response = input(f'{prompt} [y/N]: ').strip().lower()
+    return response in ['y', 'yes']
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description='Development environment cleanup tool for reclaiming disk space',
+        epilog="""
+Cleaners:
+  python    Clean __pycache__, .venv, .pytest_cache, .mypy_cache, .ruff_cache,
+            *.egg-info directories, and pip/uv package caches
+  node      Clean node_modules, dist, build, .next, .nuxt directories,
+            and npm package cache
+  rust      Clean target directories (Cargo build artifacts)
+  docker    Clean stopped containers, unused images, volumes, networks,
+            and build cache
+  podman    Clean stopped containers, unused images, and volumes
+  brew      Clean Homebrew cache and old package versions
+
+Types (for docker/podman):
+  containers, images, volumes, networks, cache
+
+Examples:
+  %(prog)s ~/projects/myapp                        Auto-detect project type and clean
+  %(prog)s .                                       Clean current directory
+  %(prog)s . --dry-run                             Preview what would be cleaned
+  %(prog)s . --cleaners python node                Run only Python and Node cleaners
+  %(prog)s . --cleaners python --yes               Clean Python artifacts without confirmation
+  %(prog)s . --cleaners docker                     Clean all Docker artifacts
+  %(prog)s . --cleaners docker --types images      Clean only unused Docker images
+  %(prog)s . --cleaners docker --types containers volumes
+                                                   Clean containers and volumes only
+  %(prog)s . --cleaners brew                       Clean Homebrew cache
+
+Environment:
+  DEBUG=1    Enable debug logging with file output to ~/.dotfiles/.logs/cleanup/
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    parser.add_argument(
+        'path', nargs='?', default='.', help='Directory to scan for cleanable items (default: current directory)'
+    )
+    parser.add_argument(
+        '--dry-run', '-n', action='store_true', help='Show what would be cleaned without actually deleting anything'
+    )
+    parser.add_argument('--yes', '-y', action='store_true', help='Skip confirmation prompts and clean immediately')
+    parser.add_argument(
+        '--cleaners',
+        '-c',
+        nargs='+',
+        choices=list(Cleaner.registry.keys()),
+        metavar='CLEANER',
+        help=f'Cleaners to run: {", ".join(Cleaner.registry.keys())} (default: auto-detect based on project files)',
+    )
+    parser.add_argument(
+        '--types',
+        '-t',
+        nargs='+',
+        metavar='TYPE',
+        help='For docker/podman: specific artifact types to clean (containers, images, volumes, networks, cache)',
+    )
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        return
+
+    args = parser.parse_args()
+
+    target_path = pathlib.Path(args.path).resolve()
+
+    if not target_path.exists():
+        logger.error(f'path does not exist: {target_path}')
+        sys.exit(1)
+
+    if not target_path.is_dir():
+        logger.error(f'path is not a directory: {target_path}')
+        sys.exit(1)
+
+    all_cleaners: dict[str, Cleaner] = {}
+    for name, cls in Cleaner.registry.items():
+        if issubclass(cls, PathScanMixin):
+            all_cleaners[name] = cls(target_path, args.dry_run, args.yes)  # type: ignore[arg-type, call-arg]
+        else:
+            all_cleaners[name] = cls(args.dry_run, args.yes, args.types)  # type: ignore[call-arg]
+
+    if args.cleaners:
+        cleaners = [all_cleaners[name] for name in args.cleaners]
+    else:
+        cleaners = [c for c in all_cleaners.values() if c.can_handle()]
+
+    if not cleaners:
+        logger.info('no applicable cleaners found')
+        sys.exit(1)
+
+    logger.info(f'target: {target_path}')
+
+    total_freed = 0
+    total_success = 0
+    total_failures = 0
+
+    for cleaner in cleaners:
+        result = cleaner.execute()
+        total_freed += result.size_freed
+        total_success += result.success_count
+        total_failures += result.failure_count
+
+    if total_success > 0:
+        summary = f'total: {total_success} items'
+        if total_freed > 0:
+            summary += f', {format_size(total_freed)} freed'
+        logger.info(summary)
+    if total_failures > 0:
+        logger.warning(f'failures: {total_failures}')
+
+
+if __name__ == '__main__':
+    main()

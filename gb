@@ -1,0 +1,774 @@
+#!/usr/bin/env python3
+
+# python3.11+
+import argparse
+import concurrent.futures
+import dataclasses
+import datetime
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+GIT_ENV = dict(os.environ, GIT_TERMINAL_PROMPT='0')
+GITHUB_API = 'https://api.github.com'
+
+
+@dataclasses.dataclass(frozen=True)
+class RepoStatus:
+    path: pathlib.Path
+    branch: str
+    has_upstream: bool
+    ahead: int
+    behind: int
+    staged: int
+    unstaged: int
+    untracked: int
+    conflicts: int
+    stashes: int
+    error: str
+
+
+def run_git(repo: pathlib.Path, args: list[str], timeout: int = 15) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            ['git', *args],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=GIT_ENV,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 1, '', 'timed out')
+    except OSError as err:
+        return subprocess.CompletedProcess(args, 1, '', str(err))
+
+
+def find_git_repos(root: pathlib.Path, max_depth: int) -> list[pathlib.Path]:
+    if (root / '.git').exists():
+        return [root]
+    return walk_for_repos(root, max_depth)
+
+
+def walk_for_repos(directory: pathlib.Path, depth_remaining: int) -> list[pathlib.Path]:
+    if depth_remaining < 0:
+        return []
+    try:
+        entries = sorted(directory.iterdir())
+    except PermissionError:
+        return []
+
+    repos = []
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        if (entry / '.git').exists():
+            repos.append(entry)
+            continue
+        repos.extend(walk_for_repos(entry, depth_remaining - 1))
+    return repos
+
+
+def parse_status_lines(lines: list[str]) -> dict[str, str | int | bool]:
+    branch = 'HEAD'
+    has_upstream = False
+    ahead = 0
+    behind = 0
+    staged = 0
+    unstaged = 0
+    untracked = 0
+    conflicts = 0
+
+    for line in lines:
+        if line.startswith('# branch.head '):
+            branch = line.split(' ', 2)[2]
+        elif line.startswith('# branch.upstream '):
+            has_upstream = True
+        elif line.startswith('# branch.ab '):
+            _, _, ahead_part, behind_part = line.split()
+            ahead = int(ahead_part.lstrip('+'))
+            behind = int(behind_part.lstrip('-'))
+        elif line.startswith('1 ') or line.startswith('2 '):
+            xy = line.split(' ', 2)[1]
+            staged += xy[0] != '.'
+            unstaged += xy[1] != '.'
+        elif line.startswith('u '):
+            conflicts += 1
+        elif line.startswith('? '):
+            untracked += 1
+
+    return {
+        'branch': branch,
+        'has_upstream': has_upstream,
+        'ahead': ahead,
+        'behind': behind,
+        'staged': staged,
+        'unstaged': unstaged,
+        'untracked': untracked,
+        'conflicts': conflicts,
+    }
+
+
+def count_stashes(repo: pathlib.Path) -> int:
+    result = run_git(repo, ['stash', 'list'])
+    if result.returncode != 0:
+        return 0
+    return len([line for line in result.stdout.splitlines() if line.strip()])
+
+
+def collect_status(repo: pathlib.Path) -> RepoStatus:
+    result = run_git(repo, ['status', '--porcelain=2', '--branch'])
+    if result.returncode != 0:
+        return RepoStatus(repo, '', False, 0, 0, 0, 0, 0, 0, 0, result.stderr.strip())
+
+    fields = parse_status_lines(result.stdout.splitlines())
+    stashes = count_stashes(repo)
+    return RepoStatus(path=repo, stashes=stashes, error='', **fields)
+
+
+def fetch_repo(repo: pathlib.Path) -> None:
+    run_git(repo, ['fetch', '--quiet', '--all'], timeout=30)
+
+
+def collect_all(repos: list[pathlib.Path], fetch: bool, workers: int) -> list[RepoStatus]:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        if fetch:
+            list(executor.map(fetch_repo, repos))
+        return list(executor.map(collect_status, repos))
+
+
+def is_dirty(status: RepoStatus) -> bool:
+    return status.staged > 0 or status.unstaged > 0 or status.untracked > 0 or status.conflicts > 0
+
+
+def is_out_of_sync(status: RepoStatus) -> bool:
+    return status.ahead > 0 or status.behind > 0
+
+
+def status_label(status: RepoStatus) -> str:
+    if status.error:
+        return 'error'
+
+    labels = []
+    if is_dirty(status):
+        labels.append('dirty')
+    if status.ahead > 0 and status.behind > 0:
+        labels.append('diverged')
+    elif status.ahead > 0:
+        labels.append('ahead')
+    elif status.behind > 0:
+        labels.append('behind')
+    if not status.has_upstream:
+        labels.append('no-upstream')
+
+    return ','.join(labels) if labels else 'clean'
+
+
+def changes_summary(status: RepoStatus) -> str:
+    parts = []
+    if status.staged:
+        parts.append(f'{status.staged}staged')
+    if status.unstaged:
+        parts.append(f'{status.unstaged}modified')
+    if status.untracked:
+        parts.append(f'{status.untracked}untracked')
+    if status.conflicts:
+        parts.append(f'{status.conflicts}conflict')
+    if status.stashes:
+        parts.append(f'{status.stashes}stash')
+    return ' '.join(parts) if parts else '-'
+
+
+def first_error_line(message: str) -> str:
+    stripped = message.strip()
+    if not stripped:
+        return 'unknown error'
+    return stripped.splitlines()[0]
+
+
+def ahead_behind(status: RepoStatus) -> str:
+    if status.ahead == 0 and status.behind == 0:
+        return '-'
+    return f'+{status.ahead}/-{status.behind}'
+
+
+def matches_filter(status: RepoStatus, dirty_only: bool, out_of_sync_only: bool) -> bool:
+    if dirty_only and not is_dirty(status):
+        return False
+    if out_of_sync_only and not is_out_of_sync(status):
+        return False
+    return True
+
+
+def print_report(statuses: list[RepoStatus], dirty_only: bool, out_of_sync_only: bool) -> None:
+    visible = [s for s in statuses if matches_filter(s, dirty_only, out_of_sync_only)]
+    if not visible:
+        print('no repositories matched')
+        return
+
+    name_width = max(len(s.path.name) for s in visible)
+    label_width = max(len(status_label(s)) for s in visible)
+    branch_width = max(len(s.branch) for s in visible)
+    for status in visible:
+        if status.error:
+            print(
+                f'{status.path.name:<{name_width}}  '
+                f'{"error":<{label_width}}  '
+                f'{"-":<{branch_width}}  '
+                f'{"-":<8}  '
+                f'{first_error_line(status.error):<28}  '
+                f'{status.path}'
+            )
+            continue
+        print(
+            f'{status.path.name:<{name_width}}  '
+            f'{status_label(status):<{label_width}}  '
+            f'{status.branch:<{branch_width}}  '
+            f'{ahead_behind(status):<8}  '
+            f'{changes_summary(status):<28}  '
+            f'{status.path}'
+        )
+
+
+def print_summary(statuses: list[RepoStatus]) -> None:
+    total = len(statuses)
+    dirty = sum(is_dirty(s) for s in statuses)
+    out_of_sync = sum(is_out_of_sync(s) for s in statuses)
+    no_upstream = sum(not s.has_upstream and not s.error for s in statuses)
+    errors = sum(bool(s.error) for s in statuses)
+    clean = sum(status_label(s) == 'clean' for s in statuses)
+
+    print()
+    print(f'total repos: {total}')
+    print(f'clean: {clean}')
+    print(f'with uncommitted changes: {dirty}')
+    print(f'out of sync with upstream: {out_of_sync}')
+    print(f'without an upstream branch: {no_upstream}')
+    print(f'errors: {errors}')
+
+
+def print_json(statuses: list[RepoStatus]) -> None:
+    rows = [
+        dataclasses.asdict(s) | {'name': s.path.name, 'path': str(s.path), 'label': status_label(s)} for s in statuses
+    ]
+    print(json.dumps(rows, indent=2))
+
+
+def resolve_repos(paths: list[pathlib.Path], depth: int) -> list[pathlib.Path]:
+    repos = []
+    for path in paths:
+        if not path.exists():
+            print(f'path does not exist: {path}', file=sys.stderr)
+            continue
+        repos.extend(find_git_repos(path.resolve(), depth))
+    return repos
+
+
+def run_status(args: argparse.Namespace) -> None:
+    repos = resolve_repos(args.paths, args.depth)
+    if not repos:
+        sys.exit('no git repositories found')
+
+    statuses = collect_all(repos, args.fetch, args.workers)
+    statuses.sort(key=lambda s: s.path.name.lower())
+
+    if args.json:
+        print_json(statuses)
+        return
+
+    print_report(statuses, args.dirty, args.out_of_sync)
+    if not args.quiet:
+        print_summary(statuses)
+
+
+@dataclasses.dataclass(frozen=True)
+class RemoteRepo:
+    name: str
+    clone_url: str
+    ssh_url: str
+    fork: bool
+    archived: bool
+
+
+def github_request(url: str, token: str, exit_on_error: bool = True) -> dict | list | None:
+    headers = {'Accept': 'application/vnd.github+json'}
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return json.loads(response.read().decode('utf-8'))
+    except urllib.error.HTTPError as err:
+        if exit_on_error:
+            sys.exit(f'github api error for {url}: {err.code} {err.reason}')
+        return None
+    except urllib.error.URLError as err:
+        if exit_on_error:
+            sys.exit(f'failed to reach github api: {err.reason}')
+        return None
+
+
+def parse_account_name(target: str) -> str:
+    if 'github.com' not in target:
+        return target
+    parsed = urllib.parse.urlparse(target)
+    parts = parsed.path.strip('/').split('/')
+    return parts[0] if parts and parts[0] else target
+
+
+def resolve_account_type(name: str, token: str) -> str:
+    data = github_request(f'{GITHUB_API}/users/{name}', token)
+    return data.get('type', 'User')
+
+
+def list_remote_repos(name: str, token: str) -> list[RemoteRepo]:
+    account_type = resolve_account_type(name, token)
+    endpoint = 'orgs' if account_type == 'Organization' else 'users'
+
+    repos = []
+    page = 1
+    while True:
+        url = f'{GITHUB_API}/{endpoint}/{name}/repos?per_page=100&page={page}'
+        batch = github_request(url, token)
+        if not batch:
+            break
+        repos.extend(RemoteRepo(r['name'], r['clone_url'], r['ssh_url'], r['fork'], r['archived']) for r in batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return repos
+
+
+def filter_repos(repos: list[RemoteRepo], include_forks: bool, include_archived: bool) -> list[RemoteRepo]:
+    result = []
+    for repo in repos:
+        if repo.fork and not include_forks:
+            continue
+        if repo.archived and not include_archived:
+            continue
+        result.append(repo)
+    return result
+
+
+def clone_repo(repo: RemoteRepo, dest_dir: pathlib.Path, use_ssh: bool) -> str:
+    dest_path = dest_dir / repo.name
+    if dest_path.exists():
+        return f'skipped (already exists): {repo.name}'
+
+    url = repo.ssh_url if use_ssh else repo.clone_url
+    result = subprocess.run(
+        ['git', 'clone', '--quiet', url, str(dest_path)],
+        capture_output=True,
+        text=True,
+        env=GIT_ENV,
+    )
+    if result.returncode != 0:
+        return f'failed: {repo.name}: {first_error_line(result.stderr)}'
+    return f'cloned: {repo.name}'
+
+
+def clone_all(repos: list[RemoteRepo], dest_dir: pathlib.Path, use_ssh: bool, workers: int) -> list[str]:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(clone_repo, repo, dest_dir, use_ssh) for repo in repos]
+        return [future.result() for future in futures]
+
+
+def print_clone_results(results: list[str]) -> None:
+    for line in results:
+        print(line)
+
+    cloned = sum(line.startswith('cloned') for line in results)
+    skipped = sum(line.startswith('skipped') for line in results)
+    failed = sum(line.startswith('failed') for line in results)
+    print()
+    print(f'cloned: {cloned}, skipped: {skipped}, failed: {failed}')
+
+
+def run_clone(args: argparse.Namespace) -> None:
+    token = args.token or os.environ.get('GITHUB_TOKEN', '')
+    account = parse_account_name(args.target)
+
+    print(f'looking up repositories for {account}')
+    repos = list_remote_repos(account, token)
+    repos = filter_repos(repos, args.include_forks, args.include_archived)
+    if not repos:
+        sys.exit('no repositories found')
+
+    dest_dir = args.dest or pathlib.Path(account)
+    print(f'cloning {len(repos)} repositories into {dest_dir}')
+    results = clone_all(repos, dest_dir, args.ssh, args.workers)
+    print_clone_results(results)
+
+
+def parse_folder_url(url: str) -> tuple[str, str, str, str]:
+    trimmed = url.rstrip('/')
+    parsed = urllib.parse.urlparse(trimmed)
+    if 'github.com' not in parsed.netloc:
+        sys.exit('expected a github.com url')
+
+    parts = parsed.path.strip('/').split('/')
+    if len(parts) < 3:
+        sys.exit('expected format: https://github.com/owner/repo/tree/branch/path/to/folder')
+
+    owner = parts[0]
+    repo = parts[1]
+    if parts[2] == 'tree' and len(parts) > 3:
+        branch = parts[3]
+        folder = '/'.join(parts[4:]) if len(parts) > 4 else ''
+    else:
+        branch = ''
+        folder = '/'.join(parts[2:])
+
+    if not folder:
+        sys.exit('no folder path found in url')
+    return owner, repo, folder, branch
+
+
+def resolve_branch(owner: str, repo: str, branch: str, token: str) -> str:
+    if branch:
+        return branch
+    data = github_request(f'{GITHUB_API}/repos/{owner}/{repo}', token)
+    return data.get('default_branch', 'main')
+
+
+def get_folder_contents(owner: str, repo: str, folder: str, branch: str, token: str) -> list[dict]:
+    url = f'{GITHUB_API}/repos/{owner}/{repo}/contents/{folder}?ref={branch}'
+    data = github_request(url, token, exit_on_error=False)
+    if data is None:
+        print(f'could not fetch folder contents: {folder}', file=sys.stderr)
+        return []
+    return data
+
+
+def download_file(url: str, destination: pathlib.Path, token: str) -> bool:
+    headers = {'Authorization': f'Bearer {token}'} if token else {}
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(response.read())
+        return True
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError) as err:
+        print(f'failed to download {destination}: {err}', file=sys.stderr)
+        return False
+
+
+def download_folder(
+    owner: str,
+    repo: str,
+    folder_path: str,
+    destination: pathlib.Path,
+    branch: str,
+    token: str,
+    executor: concurrent.futures.ThreadPoolExecutor,
+) -> bool:
+    contents = get_folder_contents(owner, repo, folder_path, branch, token)
+    if not contents:
+        return False
+
+    success = True
+    futures = []
+    for item in contents:
+        if item['type'] == 'dir':
+            sub_path = f'{folder_path}/{item["name"]}'
+            sub_dest = destination / item['name']
+            if not download_folder(owner, repo, sub_path, sub_dest, branch, token, executor):
+                success = False
+        elif item['type'] == 'file':
+            print(f'downloading {item["path"]}')
+            futures.append(executor.submit(download_file, item['download_url'], destination / item['name'], token))
+
+    for future in concurrent.futures.as_completed(futures):
+        if not future.result():
+            success = False
+    return success
+
+
+def run_fetch(args: argparse.Namespace) -> None:
+    token = args.token or os.environ.get('GITHUB_TOKEN', '')
+    owner, repo, folder, branch = parse_folder_url(args.url)
+    branch = resolve_branch(owner, repo, branch, token)
+
+    dest_path = args.dest or pathlib.Path(folder.split('/')[-1])
+    if dest_path.exists():
+        sys.exit(f'destination already exists: {dest_path}')
+
+    print(f'fetching {owner}/{repo}/{folder} from {branch}')
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+        success = download_folder(owner, repo, folder, dest_path, branch, token, executor)
+
+    if not success:
+        sys.exit(f'some files failed to download, see {dest_path}')
+    print(f'fetched to: {dest_path}')
+
+
+def pull_repo(status: RepoStatus) -> str:
+    if status.error:
+        return f'skipped (status error): {status.path.name}'
+    if is_dirty(status):
+        return f'skipped (dirty): {status.path.name}'
+    if not status.has_upstream:
+        return f'skipped (no upstream): {status.path.name}'
+
+    result = run_git(status.path, ['pull', '--ff-only', '--quiet'], timeout=60)
+    if result.returncode != 0:
+        return f'failed: {status.path.name}: {first_error_line(result.stderr or result.stdout)}'
+    return f'pulled: {status.path.name}'
+
+
+def pull_all(statuses: list[RepoStatus], workers: int) -> list[str]:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        return list(executor.map(pull_repo, statuses))
+
+
+def print_pull_results(results: list[str]) -> None:
+    for line in results:
+        print(line)
+
+    pulled = sum(line.startswith('pulled') for line in results)
+    skipped = sum(line.startswith('skipped') for line in results)
+    failed = sum(line.startswith('failed') for line in results)
+    print()
+    print(f'pulled: {pulled}, skipped: {skipped}, failed: {failed}')
+
+
+def run_pull(args: argparse.Namespace) -> None:
+    repos = resolve_repos(args.paths, args.depth)
+    if not repos:
+        sys.exit('no git repositories found')
+
+    statuses = collect_all(repos, False, args.workers)
+    results = pull_all(statuses, args.workers)
+    print_pull_results(results)
+
+
+def merged_branches(repo: pathlib.Path, protected: set[str]) -> list[str]:
+    result = run_git(repo, ['branch', '--merged'])
+    if result.returncode != 0:
+        return []
+
+    branches = []
+    for line in result.stdout.splitlines():
+        name = line.strip().lstrip('*').strip()
+        if name and name not in protected:
+            branches.append(name)
+    return branches
+
+
+def prune_repo(repo: pathlib.Path, protected: set[str], apply: bool) -> list[str]:
+    branches = merged_branches(repo, protected)
+    lines = []
+    for branch in branches:
+        if not apply:
+            lines.append(f'would delete: {repo.name}/{branch}')
+            continue
+        result = run_git(repo, ['branch', '-d', branch])
+        if result.returncode == 0:
+            lines.append(f'deleted: {repo.name}/{branch}')
+        else:
+            lines.append(f'failed to delete: {repo.name}/{branch}: {first_error_line(result.stderr)}')
+    return lines
+
+
+def prune_all(repos: list[pathlib.Path], protected: set[str], apply: bool, workers: int) -> list[str]:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        results = executor.map(lambda repo: prune_repo(repo, protected, apply), repos)
+        return [line for lines in results for line in lines]
+
+
+def run_prune(args: argparse.Namespace) -> None:
+    repos = resolve_repos(args.paths, args.depth)
+    if not repos:
+        sys.exit('no git repositories found')
+
+    protected = {name.strip() for name in args.protect.split(',') if name.strip()}
+    lines = prune_all(repos, protected, args.apply, args.workers)
+    if not lines:
+        print('no merged branches found')
+        return
+
+    for line in lines:
+        print(line)
+    if not args.apply:
+        print()
+        print('dry run, nothing deleted, pass --apply to actually delete these branches')
+
+
+@dataclasses.dataclass(frozen=True)
+class StaleInfo:
+    path: pathlib.Path
+    last_commit_epoch: int | None
+    days_idle: float
+
+
+def last_commit_epoch(repo: pathlib.Path) -> int | None:
+    result = run_git(repo, ['log', '-1', '--format=%ct'])
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return int(result.stdout.strip())
+
+
+def collect_stale(repo: pathlib.Path) -> StaleInfo:
+    epoch = last_commit_epoch(repo)
+    if epoch is None:
+        return StaleInfo(repo, None, -1.0)
+    return StaleInfo(repo, epoch, (time.time() - epoch) / 86400)
+
+
+def collect_all_stale(repos: list[pathlib.Path], workers: int) -> list[StaleInfo]:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        return list(executor.map(collect_stale, repos))
+
+
+def print_stale_report(infos: list[StaleInfo], threshold_days: int) -> None:
+    stale = [info for info in infos if info.last_commit_epoch is not None and info.days_idle >= threshold_days]
+    stale.sort(key=lambda info: info.days_idle, reverse=True)
+    if not stale:
+        print(f'no repos idle for {threshold_days}+ days')
+        return
+
+    name_width = max(len(info.path.name) for info in stale)
+    for info in stale:
+        last_date = datetime.datetime.fromtimestamp(info.last_commit_epoch).date()
+        print(f'{info.path.name:<{name_width}}  {info.days_idle:>6.0f}d idle  last commit {last_date}  {info.path}')
+
+
+def run_stale(args: argparse.Namespace) -> None:
+    repos = resolve_repos(args.paths, args.depth)
+    if not repos:
+        sys.exit('no git repositories found')
+
+    infos = collect_all_stale(repos, args.workers)
+    print_stale_report(infos, args.days)
+
+
+def add_status_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser('status', help='check status of local git repositories')
+    parser.add_argument(
+        'paths',
+        type=pathlib.Path,
+        nargs='*',
+        default=[pathlib.Path.cwd()],
+        help='directories to scan for git repositories, default is the current directory',
+    )
+    parser.add_argument(
+        '--depth',
+        type=int,
+        default=2,
+        help='how many directory levels to search under each path for repositories',
+    )
+    parser.add_argument(
+        '--fetch',
+        action='store_true',
+        help='run git fetch before checking status, needed for accurate ahead/behind counts',
+    )
+    parser.add_argument('--workers', type=int, default=8, help='number of repositories to check concurrently')
+    parser.add_argument('--dirty', action='store_true', help='only show repos with uncommitted changes')
+    parser.add_argument('--out-of-sync', action='store_true', help='only show repos ahead or behind upstream')
+    parser.add_argument('--json', action='store_true', help='print results as json instead of a table')
+    parser.add_argument('--quiet', action='store_true', help='skip the summary footer')
+    parser.set_defaults(func=run_status)
+
+
+def add_clone_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser('clone', help='clone every repository from a github user or org')
+    parser.add_argument('target', help='github username, org name, or profile url')
+    parser.add_argument('--dest', type=pathlib.Path, default=None, help='destination directory, default is ./<account>')
+    parser.add_argument('--ssh', action='store_true', help='clone over ssh instead of https')
+    parser.add_argument('--include-forks', action='store_true', help='also clone forked repositories')
+    parser.add_argument('--include-archived', action='store_true', help='also clone archived repositories')
+    parser.add_argument('--workers', type=int, default=4, help='number of repositories to clone concurrently')
+    parser.add_argument(
+        '--token',
+        default='',
+        help='github token for private repos and higher rate limits, falls back to GITHUB_TOKEN env var',
+    )
+    parser.set_defaults(func=run_clone)
+
+
+def add_fetch_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser('fetch', help='download a single folder from a github repo, no full clone')
+    parser.add_argument('url', help='github url to the folder, e.g. https://github.com/owner/repo/tree/main/path')
+    parser.add_argument(
+        '--dest', type=pathlib.Path, default=None, help='destination directory, default is the folder name'
+    )
+    parser.add_argument('--workers', type=int, default=5, help='number of files to download concurrently')
+    parser.add_argument(
+        '--token',
+        default='',
+        help='github token for private repos and higher rate limits, falls back to GITHUB_TOKEN env var',
+    )
+    parser.set_defaults(func=run_fetch)
+
+
+def add_pull_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser('pull', help='fast-forward pull every clean repo in a folder')
+    parser.add_argument(
+        'paths',
+        type=pathlib.Path,
+        nargs='*',
+        default=[pathlib.Path.cwd()],
+        help='directories to scan for git repositories, default is the current directory',
+    )
+    parser.add_argument('--depth', type=int, default=2, help='how many directory levels to search for repositories')
+    parser.add_argument('--workers', type=int, default=8, help='number of repositories to pull concurrently')
+    parser.set_defaults(func=run_pull)
+
+
+def add_prune_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser('prune', help='delete local branches already merged into the current branch')
+    parser.add_argument(
+        'paths',
+        type=pathlib.Path,
+        nargs='*',
+        default=[pathlib.Path.cwd()],
+        help='directories to scan for git repositories, default is the current directory',
+    )
+    parser.add_argument('--depth', type=int, default=2, help='how many directory levels to search for repositories')
+    parser.add_argument('--protect', default='main,master', help='comma separated branch names to never delete')
+    parser.add_argument('--apply', action='store_true', help='actually delete branches, default is a dry run')
+    parser.add_argument('--workers', type=int, default=8, help='number of repositories to check concurrently')
+    parser.set_defaults(func=run_prune)
+
+
+def add_stale_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser('stale', help='list repos with no commits in a while')
+    parser.add_argument(
+        'paths',
+        type=pathlib.Path,
+        nargs='*',
+        default=[pathlib.Path.cwd()],
+        help='directories to scan for git repositories, default is the current directory',
+    )
+    parser.add_argument('--depth', type=int, default=2, help='how many directory levels to search for repositories')
+    parser.add_argument('--days', type=int, default=90, help='minimum days since last commit to be considered stale')
+    parser.add_argument('--workers', type=int, default=8, help='number of repositories to check concurrently')
+    parser.set_defaults(func=run_stale)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog='gb', description='a multitool for working with many git repositories')
+    subparsers = parser.add_subparsers(dest='command', required=True)
+    add_status_parser(subparsers)
+    add_clone_parser(subparsers)
+    add_fetch_parser(subparsers)
+    add_pull_parser(subparsers)
+    add_prune_parser(subparsers)
+    add_stale_parser(subparsers)
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    args.func(args)
+
+
+if __name__ == '__main__':
+    main()
