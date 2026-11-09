@@ -20,7 +20,7 @@ import urllib.parse
 import urllib.request
 
 GIT_ENV = dict(os.environ, GIT_TERMINAL_PROMPT='0')
-GITHUB_API = 'https://api.github.com'
+GITHUB_HOST = 'github.com'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -300,6 +300,12 @@ class RemoteRepo:
     archived: bool
 
 
+def api_base(host: str) -> str:
+    if host in (GITHUB_HOST, f'www.{GITHUB_HOST}'):
+        return f'https://api.{GITHUB_HOST}'
+    return f'https://{host}/api/v3'
+
+
 def github_request(url: str, token: str, exit_on_error: bool = True) -> dict | list | None:
     headers = {'Accept': 'application/vnd.github+json'}
     if token:
@@ -318,27 +324,33 @@ def github_request(url: str, token: str, exit_on_error: bool = True) -> dict | l
         return None
 
 
-def parse_account_name(target: str) -> str:
-    if 'github.com' not in target:
-        return target
+def parse_account_target(target: str) -> tuple[str, str]:
+    if '://' not in target:
+        first_segment = target.partition('/')[0]
+        if '.' not in first_segment:
+            return GITHUB_HOST, first_segment
+        target = f'https://{target}'
+
     parsed = urllib.parse.urlparse(target)
-    parts = parsed.path.strip('/').split('/')
-    return parts[0] if parts and parts[0] else target
+    parts = [part for part in parsed.path.split('/') if part]
+    if not parts:
+        sys.exit(f'no account found in: {target}, expected format: https://<host>/<account>')
+    return parsed.netloc, parts[0]
 
 
-def resolve_account_type(name: str, token: str) -> str:
-    data = github_request(f'{GITHUB_API}/users/{name}', token)
+def resolve_account_type(api: str, name: str, token: str) -> str:
+    data = github_request(f'{api}/users/{name}', token)
     return data.get('type', 'User')
 
 
-def list_remote_repos(name: str, token: str) -> list[RemoteRepo]:
-    account_type = resolve_account_type(name, token)
+def list_remote_repos(api: str, name: str, token: str) -> list[RemoteRepo]:
+    account_type = resolve_account_type(api, name, token)
     endpoint = 'orgs' if account_type == 'Organization' else 'users'
 
     repos = []
     page = 1
     while True:
-        url = f'{GITHUB_API}/{endpoint}/{name}/repos?per_page=100&page={page}'
+        url = f'{api}/{endpoint}/{name}/repos?per_page=100&page={page}'
         batch = github_request(url, token)
         if not batch:
             break
@@ -408,10 +420,10 @@ def print_clone_results(results: list[str]) -> None:
 
 def run_clone(args: argparse.Namespace) -> None:
     token = args.token or os.environ.get('GITHUB_TOKEN', '')
-    account = parse_account_name(args.target)
+    host, account = parse_account_target(args.target)
 
-    print(f'looking up repositories for {account}')
-    repos = list_remote_repos(account, token)
+    print(f'looking up repositories for {account} on {host}')
+    repos = list_remote_repos(api_base(host), account, token)
     repos = filter_repos(repos, args.include_forks, args.include_archived)
     if not repos:
         sys.exit('no repositories found')
@@ -422,15 +434,15 @@ def run_clone(args: argparse.Namespace) -> None:
     print_clone_results(results)
 
 
-def parse_github_url(url: str) -> tuple[str, str, str, str]:
+def parse_github_url(url: str) -> tuple[str, str, str, str, str]:
     trimmed = url.rstrip('/')
+    if '://' not in trimmed:
+        trimmed = f'https://{trimmed}'
     parsed = urllib.parse.urlparse(trimmed)
-    if 'github.com' not in parsed.netloc:
-        sys.exit('expected a github.com url')
 
     parts = parsed.path.strip('/').split('/')
     if len(parts) < 3:
-        sys.exit('expected format: https://github.com/owner/repo/tree/branch/path/to/folder or .../blob/branch/path/to/file')
+        sys.exit('expected format: https://<host>/owner/repo/tree/branch/path/to/folder or .../blob/branch/path/to/file')
 
     owner = parts[0]
     repo = parts[1]
@@ -443,18 +455,18 @@ def parse_github_url(url: str) -> tuple[str, str, str, str]:
 
     if not path:
         sys.exit('no folder or file path found in url')
-    return owner, repo, path, branch
+    return parsed.netloc, owner, repo, path, branch
 
 
-def resolve_branch(owner: str, repo: str, branch: str, token: str) -> str:
+def resolve_branch(api: str, owner: str, repo: str, branch: str, token: str) -> str:
     if branch:
         return branch
-    data = github_request(f'{GITHUB_API}/repos/{owner}/{repo}', token)
+    data = github_request(f'{api}/repos/{owner}/{repo}', token)
     return data.get('default_branch', 'main')
 
 
-def contents_url(owner: str, repo: str, path: str, branch: str) -> str:
-    return f'{GITHUB_API}/repos/{owner}/{repo}/contents/{path}?ref={branch}'
+def contents_url(api: str, owner: str, repo: str, path: str, branch: str) -> str:
+    return f'{api}/repos/{owner}/{repo}/contents/{path}?ref={branch}'
 
 
 def download_file(url: str, destination: pathlib.Path, token: str) -> bool:
@@ -471,6 +483,7 @@ def download_file(url: str, destination: pathlib.Path, token: str) -> bool:
 
 
 def download_folder(
+    api: str,
     owner: str,
     repo: str,
     folder_path: str,
@@ -479,7 +492,7 @@ def download_folder(
     token: str,
     executor: concurrent.futures.ThreadPoolExecutor,
 ) -> bool:
-    contents = github_request(contents_url(owner, repo, folder_path, branch), token, exit_on_error=False)
+    contents = github_request(contents_url(api, owner, repo, folder_path, branch), token, exit_on_error=False)
     if not isinstance(contents, list):
         print(f'could not fetch folder contents: {folder_path}', file=sys.stderr)
         return False
@@ -491,7 +504,7 @@ def download_folder(
         if item['type'] == 'dir':
             sub_path = f'{folder_path}/{item["name"]}'
             sub_dest = destination / item['name']
-            if not download_folder(owner, repo, sub_path, sub_dest, branch, token, executor):
+            if not download_folder(api, owner, repo, sub_path, sub_dest, branch, token, executor):
                 success = False
         elif item['type'] == 'file':
             print(f'downloading {item["path"]}')
@@ -505,14 +518,15 @@ def download_folder(
 
 def run_fetch(args: argparse.Namespace) -> None:
     token = args.token or os.environ.get('GITHUB_TOKEN', '')
-    owner, repo, path, branch = parse_github_url(args.url)
-    branch = resolve_branch(owner, repo, branch, token)
+    host, owner, repo, path, branch = parse_github_url(args.url)
+    api = api_base(host)
+    branch = resolve_branch(api, owner, repo, branch, token)
 
     dest_path = args.dest or pathlib.Path(path.split('/')[-1])
     if dest_path.exists():
         sys.exit(f'destination already exists: {dest_path}')
 
-    contents = github_request(contents_url(owner, repo, path, branch), token)
+    contents = github_request(contents_url(api, owner, repo, path, branch), token)
     if isinstance(contents, dict) and contents.get('type') == 'file':
         print(f'fetching {owner}/{repo}/{path} from {branch}')
         if not download_file(contents['download_url'], dest_path, token):
@@ -522,7 +536,7 @@ def run_fetch(args: argparse.Namespace) -> None:
 
     print(f'fetching {owner}/{repo}/{path} from {branch}')
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
-        success = download_folder(owner, repo, path, dest_path, branch, token, executor)
+        success = download_folder(api, owner, repo, path, dest_path, branch, token, executor)
 
     if not success:
         sys.exit(f'some files failed to download, see {dest_path}')
@@ -829,7 +843,10 @@ def add_status_parser(subparsers: argparse._SubParsersAction) -> None:
 
 def add_clone_parser(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser('clone', help='clone every repository from a github user or org')
-    parser.add_argument('target', help='github username, org name, or profile url')
+    parser.add_argument(
+        'target',
+        help='github username, org name, or profile url, e.g. octocat, https://github.com/octocat, or https://ghe.example.com/acme',
+    )
     parser.add_argument('--dest', type=pathlib.Path, default=None, help='destination directory, default is ./<account>')
     parser.add_argument('--ssh', action='store_true', help='clone over ssh instead of https')
     parser.add_argument('--include-forks', action='store_true', help='also clone forked repositories')
