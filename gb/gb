@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.11"
+# requires-python = "==3.13.*"
 # ///
 
 import abc
@@ -421,13 +421,17 @@ class GitHubForge(Forge):
         return 'a classic token with repo and read:org scopes, or a fine-grained token with read access to contents'
 
     def list_repos(self, account: str) -> list[RemoteRepo]:
-        owner = self.api_get(f'/users/{account}')
-        endpoint = 'orgs' if owner.get('type') == 'Organization' else 'users'
+        if self.token and account.lower() == self.whoami().lower():
+            base = '/user/repos?affiliation=owner&'
+        else:
+            owner = self.api_get(f'/users/{account}')
+            endpoint = 'orgs' if owner.get('type') == 'Organization' else 'users'
+            base = f'/{endpoint}/{account}/repos?'
 
         repos = []
         page = 1
         while True:
-            batch = self.api_get(f'/{endpoint}/{account}/repos?per_page=100&page={page}')
+            batch = self.api_get(f'{base}per_page=100&page={page}')
             if not batch:
                 break
             repos.extend(RemoteRepo(r['name'], r['clone_url'], r['ssh_url'], r['fork'], r['archived']) for r in batch)

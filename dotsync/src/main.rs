@@ -251,6 +251,11 @@ fn git_is_installed() -> bool {
 }
 
 fn clone_repository(url: &str, branch: &str, path: &PathBuf) -> Result<(), String> {
+    if path.join(".git").exists() {
+        info!("repository already exists at {:?}, skipping clone", path);
+        return Ok(());
+    }
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create directories: {}", e))?;
