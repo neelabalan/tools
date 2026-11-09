@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
 
-# python3.11+
 import argparse
+import base64
+import collections
 import concurrent.futures
 import dataclasses
 import datetime
@@ -356,7 +360,18 @@ def filter_repos(repos: list[RemoteRepo], include_forks: bool, include_archived:
     return result
 
 
-def clone_repo(repo: RemoteRepo, dest_dir: pathlib.Path, use_ssh: bool) -> str:
+def clone_env(token: str, use_ssh: bool) -> dict[str, str]:
+    if not token or use_ssh:
+        return GIT_ENV
+    credentials = base64.b64encode(f'x-access-token:{token}'.encode()).decode()
+    return GIT_ENV | {
+        'GIT_CONFIG_COUNT': '1',
+        'GIT_CONFIG_KEY_0': 'http.extraheader',
+        'GIT_CONFIG_VALUE_0': f'Authorization: basic {credentials}',
+    }
+
+
+def clone_repo(repo: RemoteRepo, dest_dir: pathlib.Path, use_ssh: bool, token: str) -> str:
     dest_path = dest_dir / repo.name
     if dest_path.exists():
         return f'skipped (already exists): {repo.name}'
@@ -366,17 +381,17 @@ def clone_repo(repo: RemoteRepo, dest_dir: pathlib.Path, use_ssh: bool) -> str:
         ['git', 'clone', '--quiet', url, str(dest_path)],
         capture_output=True,
         text=True,
-        env=GIT_ENV,
+        env=clone_env(token, use_ssh),
     )
     if result.returncode != 0:
         return f'failed: {repo.name}: {first_error_line(result.stderr)}'
     return f'cloned: {repo.name}'
 
 
-def clone_all(repos: list[RemoteRepo], dest_dir: pathlib.Path, use_ssh: bool, workers: int) -> list[str]:
+def clone_all(repos: list[RemoteRepo], dest_dir: pathlib.Path, use_ssh: bool, token: str, workers: int) -> list[str]:
     dest_dir.mkdir(parents=True, exist_ok=True)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(clone_repo, repo, dest_dir, use_ssh) for repo in repos]
+        futures = [executor.submit(clone_repo, repo, dest_dir, use_ssh, token) for repo in repos]
         return [future.result() for future in futures]
 
 
@@ -403,11 +418,11 @@ def run_clone(args: argparse.Namespace) -> None:
 
     dest_dir = args.dest or pathlib.Path(account)
     print(f'cloning {len(repos)} repositories into {dest_dir}')
-    results = clone_all(repos, dest_dir, args.ssh, args.workers)
+    results = clone_all(repos, dest_dir, args.ssh, token, args.workers)
     print_clone_results(results)
 
 
-def parse_folder_url(url: str) -> tuple[str, str, str, str]:
+def parse_github_url(url: str) -> tuple[str, str, str, str]:
     trimmed = url.rstrip('/')
     parsed = urllib.parse.urlparse(trimmed)
     if 'github.com' not in parsed.netloc:
@@ -415,20 +430,20 @@ def parse_folder_url(url: str) -> tuple[str, str, str, str]:
 
     parts = parsed.path.strip('/').split('/')
     if len(parts) < 3:
-        sys.exit('expected format: https://github.com/owner/repo/tree/branch/path/to/folder')
+        sys.exit('expected format: https://github.com/owner/repo/tree/branch/path/to/folder or .../blob/branch/path/to/file')
 
     owner = parts[0]
     repo = parts[1]
-    if parts[2] == 'tree' and len(parts) > 3:
+    if parts[2] in ('tree', 'blob') and len(parts) > 3:
         branch = parts[3]
-        folder = '/'.join(parts[4:]) if len(parts) > 4 else ''
+        path = '/'.join(parts[4:]) if len(parts) > 4 else ''
     else:
         branch = ''
-        folder = '/'.join(parts[2:])
+        path = '/'.join(parts[2:])
 
-    if not folder:
-        sys.exit('no folder path found in url')
-    return owner, repo, folder, branch
+    if not path:
+        sys.exit('no folder or file path found in url')
+    return owner, repo, path, branch
 
 
 def resolve_branch(owner: str, repo: str, branch: str, token: str) -> str:
@@ -438,13 +453,8 @@ def resolve_branch(owner: str, repo: str, branch: str, token: str) -> str:
     return data.get('default_branch', 'main')
 
 
-def get_folder_contents(owner: str, repo: str, folder: str, branch: str, token: str) -> list[dict]:
-    url = f'{GITHUB_API}/repos/{owner}/{repo}/contents/{folder}?ref={branch}'
-    data = github_request(url, token, exit_on_error=False)
-    if data is None:
-        print(f'could not fetch folder contents: {folder}', file=sys.stderr)
-        return []
-    return data
+def contents_url(owner: str, repo: str, path: str, branch: str) -> str:
+    return f'{GITHUB_API}/repos/{owner}/{repo}/contents/{path}?ref={branch}'
 
 
 def download_file(url: str, destination: pathlib.Path, token: str) -> bool:
@@ -469,10 +479,12 @@ def download_folder(
     token: str,
     executor: concurrent.futures.ThreadPoolExecutor,
 ) -> bool:
-    contents = get_folder_contents(owner, repo, folder_path, branch, token)
-    if not contents:
+    contents = github_request(contents_url(owner, repo, folder_path, branch), token, exit_on_error=False)
+    if not isinstance(contents, list):
+        print(f'could not fetch folder contents: {folder_path}', file=sys.stderr)
         return False
 
+    destination.mkdir(parents=True, exist_ok=True)
     success = True
     futures = []
     for item in contents:
@@ -493,16 +505,24 @@ def download_folder(
 
 def run_fetch(args: argparse.Namespace) -> None:
     token = args.token or os.environ.get('GITHUB_TOKEN', '')
-    owner, repo, folder, branch = parse_folder_url(args.url)
+    owner, repo, path, branch = parse_github_url(args.url)
     branch = resolve_branch(owner, repo, branch, token)
 
-    dest_path = args.dest or pathlib.Path(folder.split('/')[-1])
+    dest_path = args.dest or pathlib.Path(path.split('/')[-1])
     if dest_path.exists():
         sys.exit(f'destination already exists: {dest_path}')
 
-    print(f'fetching {owner}/{repo}/{folder} from {branch}')
+    contents = github_request(contents_url(owner, repo, path, branch), token)
+    if isinstance(contents, dict) and contents.get('type') == 'file':
+        print(f'fetching {owner}/{repo}/{path} from {branch}')
+        if not download_file(contents['download_url'], dest_path, token):
+            sys.exit(f'failed to download file: {path}')
+        print(f'fetched to: {dest_path}')
+        return
+
+    print(f'fetching {owner}/{repo}/{path} from {branch}')
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
-        success = download_folder(owner, repo, folder, dest_path, branch, token, executor)
+        success = download_folder(owner, repo, path, dest_path, branch, token, executor)
 
     if not success:
         sys.exit(f'some files failed to download, see {dest_path}')
@@ -649,6 +669,136 @@ def run_stale(args: argparse.Namespace) -> None:
     print_stale_report(infos, args.days)
 
 
+def git_output(repo: pathlib.Path, args: list[str]) -> str:
+    result = run_git(repo, args, timeout=120)
+    return result.stdout.strip() if result.returncode == 0 else ''
+
+
+def analyze_repository(repo: pathlib.Path) -> None:
+    print('repository analytics')
+
+    if not git_output(repo, ['rev-parse', '--is-inside-work-tree']):
+        sys.exit(f'not a git repository: {repo}')
+
+    total_commits_str = git_output(repo, ['rev-list', '--count', 'HEAD'])
+    total_commits = int(total_commits_str) if total_commits_str else 0
+
+    process = subprocess.Popen(
+        ['git', 'log', '--numstat', '--pretty=format:COMMIT%x00%ct%x00%an'],
+        stdout=subprocess.PIPE,
+        text=True,
+        errors='replace',
+        cwd=repo,
+        env=GIT_ENV,
+    )
+
+    first_ts = float('inf')
+    last_ts = 0
+    contributors: dict[str, int] = collections.defaultdict(int)
+    file_churn: dict[str, int] = collections.defaultdict(int)
+    added_lines = 0
+    removed_lines = 0
+
+    for line in process.stdout:
+        line = line.strip()
+        if not line:
+            continue
+
+        if line.startswith('COMMIT\x00'):
+            parts = line.split('\x00', maxsplit=2)
+            if len(parts) == 3:
+                try:
+                    ts = int(parts[1])
+                except ValueError:
+                    continue
+                first_ts = min(first_ts, ts)
+                last_ts = max(last_ts, ts)
+                contributors[parts[2]] += 1
+        else:
+            parts = line.split(maxsplit=2)
+            if len(parts) == 3:
+                try:
+                    add = int(parts[0]) if parts[0] != '-' else 0
+                    rem = int(parts[1]) if parts[1] != '-' else 0
+                except ValueError:
+                    continue
+                added_lines += add
+                removed_lines += rem
+                file_churn[parts[2]] += 1
+
+    process.wait()
+
+    if first_ts == float('inf'):
+        print('no commits found.')
+        return
+
+    days_active = max((time.time() - first_ts) / 86400, 1.0)
+
+    print(f'average commits per day: {total_commits / days_active:.2f}')
+    print(f'average commits per week: {(total_commits / days_active) * 7:.2f}')
+    print(f'average commits per month: {(total_commits / days_active) * 30:.2f}')
+    print()
+    print(f'number of unique contributors: {len(contributors)}')
+    print()
+    print('top 10 committers:')
+    for author, count in sorted(contributors.items(), key=lambda x: x[1], reverse=True)[:10]:
+        print(f'{count:>5}  {author}')
+
+    print()
+    print(f'last commit date: {datetime.datetime.fromtimestamp(last_ts)}')
+    print(f'first commit date: {datetime.datetime.fromtimestamp(first_ts)}')
+    print()
+    print('total lines of code added/removed (entire history):')
+    print(f'added: {added_lines}')
+    print(f'removed: {removed_lines}')
+    print(f'net change: {added_lines - removed_lines}')
+    print()
+    print('top 10 most frequently changed files:')
+    for fname, count in sorted(file_churn.items(), key=lambda x: x[1], reverse=True)[:10]:
+        print(f'{count:>5} {fname}')
+
+    branches = git_output(repo, ['branch', '-r']).splitlines()
+    print()
+    print(f'number of active branches: {len(branches)}')
+
+    all_files = git_output(repo, ['ls-files']).splitlines()
+    total_files = len(all_files)
+    print(f'total number of files: {total_files}')
+
+    if total_files == 0:
+        return
+
+    print()
+    print('number of files by extension and percentage contribution:')
+    extensions: dict[str, int] = collections.defaultdict(int)
+    for f in all_files:
+        ext = pathlib.Path(f).suffix
+        extensions[ext[1:] if ext else '[no extension]'] += 1
+
+    for ext, count in sorted(extensions.items(), key=lambda x: x[1], reverse=True):
+        print(f'{count:>5} ({count / total_files * 100:.2f}%) {ext}')
+
+
+def run_stats(args: argparse.Namespace) -> None:
+    if not args.path.exists():
+        sys.exit(f'path does not exist: {args.path}')
+    if not args.path.is_dir():
+        sys.exit(f'path is not a directory: {args.path}')
+    analyze_repository(args.path.resolve())
+
+
+def add_stats_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser('stats', help='show commit, contributor, and file statistics for one repository')
+    parser.add_argument(
+        'path',
+        type=pathlib.Path,
+        nargs='?',
+        default=pathlib.Path.cwd(),
+        help='path to git repository, default is the current directory',
+    )
+    parser.set_defaults(func=run_stats)
+
+
 def add_status_parser(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser('status', help='check status of local git repositories')
     parser.add_argument(
@@ -694,8 +844,11 @@ def add_clone_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def add_fetch_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser('fetch', help='download a single folder from a github repo, no full clone')
-    parser.add_argument('url', help='github url to the folder, e.g. https://github.com/owner/repo/tree/main/path')
+    parser = subparsers.add_parser('fetch', help='download a single file or folder from a github repo, no full clone')
+    parser.add_argument(
+        'url',
+        help='github url to a file or folder, e.g. https://github.com/owner/repo/tree/main/path or .../blob/main/file.py',
+    )
     parser.add_argument(
         '--dest', type=pathlib.Path, default=None, help='destination directory, default is the folder name'
     )
@@ -754,7 +907,7 @@ def add_stale_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog='gb', description='a multitool for working with many git repositories')
+    parser = argparse.ArgumentParser(prog='gb', description='a multitool for working with git repositories')
     subparsers = parser.add_subparsers(dest='command', required=True)
     add_status_parser(subparsers)
     add_clone_parser(subparsers)
@@ -762,6 +915,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_pull_parser(subparsers)
     add_prune_parser(subparsers)
     add_stale_parser(subparsers)
+    add_stats_parser(subparsers)
     return parser
 
 
