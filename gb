@@ -3,12 +3,14 @@
 # requires-python = ">=3.11"
 # ///
 
+import abc
 import argparse
 import base64
 import collections
 import concurrent.futures
 import dataclasses
 import datetime
+import getpass
 import json
 import os
 import pathlib
@@ -18,11 +20,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import webbrowser
 
 GIT_ENV = dict(os.environ, GIT_TERMINAL_PROMPT='0')
 GITHUB_HOST = 'github.com'
-DEVICE_SCOPES = 'repo read:org'
 CREDENTIALS_PATH = pathlib.Path.home() / '.config' / 'gb' / 'credentials.json'
 
 
@@ -303,101 +303,339 @@ class RemoteRepo:
     archived: bool
 
 
+@dataclasses.dataclass(frozen=True)
+class Entry:
+    name: str
+    path: str
+    is_dir: bool
+    download_url: str = ''
+
+
+def http_json(url: str, headers: dict[str, str], exit_on_error: bool = True) -> dict | list | None:
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return json.loads(response.read().decode('utf-8'))
+    except urllib.error.HTTPError as err:
+        if exit_on_error:
+            sys.exit(f'api error for {url}: {err.code} {err.reason}')
+        return None
+    except urllib.error.URLError as err:
+        if exit_on_error:
+            sys.exit(f'failed to reach {url}: {err.reason}')
+        return None
+
+
+def download_file(url: str, destination: pathlib.Path, headers: dict[str, str]) -> bool:
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(response.read())
+        return True
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError) as err:
+        print(f'failed to download {destination}: {err}', file=sys.stderr)
+        return False
+
+
+def encode(value: str) -> str:
+    return urllib.parse.quote(value, safe='')
+
+
+class Forge(abc.ABC):
+    """A git hosting service. Each subclass speaks one service's api, the rest of gb only uses this interface."""
+
+    name: str
+    git_username: str
+
+    def __init__(self, host: str, token: str = ''):
+        self.host = canonical_host(host)
+        self.token = token
+
+    @property
+    @abc.abstractmethod
+    def api(self) -> str: ...
+
+    @abc.abstractmethod
+    def api_headers(self) -> dict[str, str]: ...
+
+    @abc.abstractmethod
+    def whoami(self) -> str: ...
+
+    @abc.abstractmethod
+    def token_url(self) -> str: ...
+
+    @abc.abstractmethod
+    def token_hint(self) -> str: ...
+
+    @abc.abstractmethod
+    def list_repos(self, account: str) -> list[RemoteRepo]: ...
+
+    @abc.abstractmethod
+    def parse_url(self, parts: list[str]) -> tuple[str, str, str]:
+        """returns (project, ref, path), ref is empty when the url does not name one"""
+
+    @abc.abstractmethod
+    def default_branch(self, project: str) -> str: ...
+
+    @abc.abstractmethod
+    def describe(self, project: str, path: str, ref: str) -> Entry | None: ...
+
+    @abc.abstractmethod
+    def list_dir(self, project: str, path: str, ref: str) -> list[Entry] | None: ...
+
+    def account_from_path(self, parts: list[str]) -> str:
+        return parts[0]
+
+    def api_get(self, path: str, exit_on_error: bool = True) -> dict | list | None:
+        return http_json(f'{self.api}{path}', self.api_headers(), exit_on_error)
+
+    def git_auth_header(self) -> str:
+        credentials = base64.b64encode(f'{self.git_username}:{self.token}'.encode()).decode()
+        return f'Authorization: basic {credentials}'
+
+
+class GitHubForge(Forge):
+    name = 'github'
+    git_username = 'x-access-token'
+
+    @property
+    def api(self) -> str:
+        if self.host == GITHUB_HOST:
+            return f'https://api.{GITHUB_HOST}'
+        return f'https://{self.host}/api/v3'
+
+    def api_headers(self) -> dict[str, str]:
+        headers = {'Accept': 'application/vnd.github+json'}
+        if self.token:
+            headers['Authorization'] = f'Bearer {self.token}'
+        return headers
+
+    def whoami(self) -> str:
+        return self.api_get('/user')['login']
+
+    def token_url(self) -> str:
+        return f'https://{self.host}/settings/tokens'
+
+    def token_hint(self) -> str:
+        return 'a classic token with repo and read:org scopes, or a fine-grained token with read access to contents'
+
+    def list_repos(self, account: str) -> list[RemoteRepo]:
+        owner = self.api_get(f'/users/{account}')
+        endpoint = 'orgs' if owner.get('type') == 'Organization' else 'users'
+
+        repos = []
+        page = 1
+        while True:
+            batch = self.api_get(f'/{endpoint}/{account}/repos?per_page=100&page={page}')
+            if not batch:
+                break
+            repos.extend(RemoteRepo(r['name'], r['clone_url'], r['ssh_url'], r['fork'], r['archived']) for r in batch)
+            if len(batch) < 100:
+                break
+            page += 1
+        return repos
+
+    def parse_url(self, parts: list[str]) -> tuple[str, str, str]:
+        if len(parts) < 3:
+            sys.exit('expected format: https://<host>/owner/repo/tree/branch/path/to/folder or .../blob/branch/path/to/file')
+        project = '/'.join(parts[:2])
+        if parts[2] in ('tree', 'blob') and len(parts) > 3:
+            ref, path = parts[3], '/'.join(parts[4:])
+        else:
+            ref, path = '', '/'.join(parts[2:])
+        if not path:
+            sys.exit('no folder or file path found in url')
+        return project, ref, path
+
+    def default_branch(self, project: str) -> str:
+        return self.api_get(f'/repos/{project}').get('default_branch', 'main')
+
+    def describe(self, project: str, path: str, ref: str) -> Entry | None:
+        data = self.api_get(f'/repos/{project}/contents/{path}?ref={ref}', exit_on_error=False)
+        if isinstance(data, dict) and data.get('type') == 'file':
+            return Entry(data['name'], data['path'], False, data['download_url'])
+        if isinstance(data, list):
+            return Entry(path.split('/')[-1], path, True)
+        return None
+
+    def list_dir(self, project: str, path: str, ref: str) -> list[Entry] | None:
+        data = self.api_get(f'/repos/{project}/contents/{path}?ref={ref}', exit_on_error=False)
+        if not isinstance(data, list):
+            return None
+        return [
+            Entry(item['name'], item['path'], item['type'] == 'dir', item.get('download_url') or '')
+            for item in data
+            if item['type'] in ('dir', 'file')
+        ]
+
+
+class GitLabForge(Forge):
+    name = 'gitlab'
+    git_username = 'oauth2'
+
+    @property
+    def api(self) -> str:
+        return f'https://{self.host}/api/v4'
+
+    def api_headers(self) -> dict[str, str]:
+        return {'PRIVATE-TOKEN': self.token} if self.token else {}
+
+    def whoami(self) -> str:
+        return self.api_get('/user')['username']
+
+    def token_url(self) -> str:
+        return f'https://{self.host}/-/user_settings/personal_access_tokens'
+
+    def token_hint(self) -> str:
+        return 'a personal access token with read_api and read_repository scopes'
+
+    def account_from_path(self, parts: list[str]) -> str:
+        return '/'.join(parts)
+
+    def list_repos(self, account: str) -> list[RemoteRepo]:
+        if self.api_get(f'/groups/{encode(account)}', exit_on_error=False) is not None:
+            endpoint, params = f'/groups/{encode(account)}/projects', {'include_subgroups': 'true'}
+        else:
+            endpoint, params = f'/users/{encode(account)}/projects', {}
+
+        repos = []
+        page = 1
+        while True:
+            query = urllib.parse.urlencode(params | {'per_page': 100, 'page': page})
+            batch = self.api_get(f'{endpoint}?{query}')
+            if not batch:
+                break
+            for project in batch:
+                name = project['path_with_namespace'].removeprefix(f'{account}/')
+                repos.append(
+                    RemoteRepo(
+                        name,
+                        project['http_url_to_repo'],
+                        project['ssh_url_to_repo'],
+                        'forked_from_project' in project,
+                        project.get('archived', False),
+                    )
+                )
+            if len(batch) < 100:
+                break
+            page += 1
+        return repos
+
+    def parse_url(self, parts: list[str]) -> tuple[str, str, str]:
+        hint = 'expected format: https://<host>/group/project/-/tree/branch/path/to/folder or .../-/blob/branch/path/to/file'
+        if '-' not in parts:
+            sys.exit(hint)
+        separator = parts.index('-')
+        rest = parts[separator + 1 :]
+        if len(rest) < 3 or rest[0] not in ('tree', 'blob'):
+            sys.exit(hint)
+        project = '/'.join(parts[:separator])
+        return project, rest[1], '/'.join(rest[2:])
+
+    def default_branch(self, project: str) -> str:
+        return self.api_get(f'/projects/{encode(project)}').get('default_branch', 'main')
+
+    def describe(self, project: str, path: str, ref: str) -> Entry | None:
+        files_url = f'/projects/{encode(project)}/repository/files/{encode(path)}?ref={encode(ref)}'
+        name = path.split('/')[-1]
+        if self.api_get(files_url, exit_on_error=False) is not None:
+            return Entry(name, path, False, self._raw_url(project, path, ref))
+        if self._tree_page(project, path, ref, 1):
+            return Entry(name, path, True)
+        return None
+
+    def list_dir(self, project: str, path: str, ref: str) -> list[Entry] | None:
+        entries = []
+        page = 1
+        while True:
+            batch = self._tree_page(project, path, ref, page)
+            if batch is None:
+                return None
+            for item in batch:
+                if item['type'] not in ('tree', 'blob'):
+                    continue
+                is_dir = item['type'] == 'tree'
+                download_url = '' if is_dir else self._raw_url(project, item['path'], ref)
+                entries.append(Entry(item['name'], item['path'], is_dir, download_url))
+            if len(batch) < 100:
+                break
+            page += 1
+        return entries
+
+    def _tree_page(self, project: str, path: str, ref: str, page: int) -> list | None:
+        query = urllib.parse.urlencode({'path': path, 'ref': ref, 'per_page': 100, 'page': page})
+        data = self.api_get(f'/projects/{encode(project)}/repository/tree?{query}', exit_on_error=False)
+        return data if isinstance(data, list) else None
+
+    def _raw_url(self, project: str, path: str, ref: str) -> str:
+        return f'{self.api}/projects/{encode(project)}/repository/files/{encode(path)}/raw?ref={encode(ref)}'
+
+
+FORGE_TYPES: dict[str, type[Forge]] = {'github': GitHubForge, 'gitlab': GitLabForge}
+KNOWN_HOSTS = {'github.com': 'github', 'gitlab.com': 'gitlab'}
+
+
 def canonical_host(host: str) -> str:
     host = host.lower()
-    if host == f'www.{GITHUB_HOST}':
-        return GITHUB_HOST
-    return host
+    return GITHUB_HOST if host == f'www.{GITHUB_HOST}' else host
 
 
-def api_base(host: str) -> str:
-    host = canonical_host(host)
-    if host == GITHUB_HOST:
-        return f'https://api.{GITHUB_HOST}'
-    return f'https://{host}/api/v3'
+def split_target(target: str) -> tuple[str, list[str]]:
+    if '://' not in target:
+        if '.' not in target.partition('/')[0]:
+            return GITHUB_HOST, [part for part in target.split('/') if part]
+        target = f'https://{target}'
+    parsed = urllib.parse.urlparse(target)
+    return canonical_host(parsed.netloc), [part for part in parsed.path.split('/') if part]
 
 
-def load_credentials() -> dict[str, str]:
+def load_credentials() -> dict[str, dict[str, str]]:
     if not CREDENTIALS_PATH.exists():
         return {}
-    return json.loads(CREDENTIALS_PATH.read_text())
+    raw = json.loads(CREDENTIALS_PATH.read_text())
+    # older files stored a bare github token per host
+    return {
+        host: {'forge': 'github', 'token': value} if isinstance(value, str) else value for host, value in raw.items()
+    }
 
 
-def save_credentials(credentials: dict[str, str]) -> None:
+def save_credentials(credentials: dict[str, dict[str, str]]) -> None:
     CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(CREDENTIALS_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, 'w') as file:
         json.dump(credentials, file, indent=2)
 
 
-def resolve_token(explicit: str, host: str) -> str:
-    if explicit:
-        return explicit
-    return load_credentials().get(canonical_host(host)) or os.environ.get('GITHUB_TOKEN', '')
-
-
-def post_form(url: str, data: dict[str, str]) -> dict:
-    request = urllib.request.Request(
-        url,
-        data=urllib.parse.urlencode(data).encode(),
-        headers={'Accept': 'application/json'},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=15) as response:
-            return json.loads(response.read().decode('utf-8'))
-    except urllib.error.HTTPError as err:
-        sys.exit(f'request to {url} failed: {err.code} {err.reason}')
-    except urllib.error.URLError as err:
-        sys.exit(f'failed to reach {url}: {err.reason}')
-
-
-def device_login(host: str, client_id: str) -> str:
-    code = post_form(f'https://{host}/login/device/code', {'client_id': client_id, 'scope': DEVICE_SCOPES})
-    if 'error' in code:
-        sys.exit(f'could not start login: {code.get("error_description", code["error"])}')
-
-    print(f'open {code["verification_uri"]} and enter the code: {code["user_code"]}')
-    webbrowser.open(code['verification_uri'])
-
-    interval = code.get('interval', 5)
-    deadline = time.time() + code['expires_in']
-    while time.time() < deadline:
-        time.sleep(interval)
-        result = post_form(
-            f'https://{host}/login/oauth/access_token',
-            {
-                'client_id': client_id,
-                'device_code': code['device_code'],
-                'grant_type': 'urn:ietf:params:oauth:grant-type:device_code',
-            },
-        )
-        if 'access_token' in result:
-            return result['access_token']
-        error = result.get('error')
-        if error == 'authorization_pending':
-            continue
-        if error == 'slow_down':
-            interval = result.get('interval', interval + 5)
-            continue
-        sys.exit(f'login failed: {result.get("error_description", error)}')
-    sys.exit('login timed out, run gb login again')
+def open_forge(host: str, explicit_token: str = '') -> Forge:
+    host = canonical_host(host)
+    stored = load_credentials().get(host, {})
+    forge_name = stored.get('forge') or KNOWN_HOSTS.get(host)
+    if not forge_name:
+        sys.exit(f'unknown host: {host}, log in first with: gb login {host} --forge github|gitlab')
+    return FORGE_TYPES[forge_name](host, explicit_token or stored.get('token', ''))
 
 
 def run_login(args: argparse.Namespace) -> None:
     host = canonical_host(args.host)
-    client_id = args.client_id or os.environ.get('GB_CLIENT_ID', '')
-    if not client_id:
-        sys.exit(
-            'no oauth client id, register an oauth app with device flow enabled on the host '
-            'and pass --client-id or set GB_CLIENT_ID'
-        )
+    forge_name = args.forge or KNOWN_HOSTS.get(host)
+    if not forge_name:
+        sys.exit(f'unknown host: {host}, pass --forge github or --forge gitlab')
 
-    token = device_login(host, client_id)
-    user = github_request(f'{api_base(host)}/user', token)
+    if args.with_token:
+        token = sys.stdin.read().strip()
+    else:
+        forge = FORGE_TYPES[forge_name](host)
+        print(f'create {forge.token_hint()} at {forge.token_url()}')
+        token = getpass.getpass(f'token for {host}: ').strip()
+    if not token:
+        sys.exit('no token provided')
+
+    username = FORGE_TYPES[forge_name](host, token).whoami()
     credentials = load_credentials()
-    credentials[host] = token
+    credentials[host] = {'forge': forge_name, 'token': token}
     save_credentials(credentials)
-    print(f'logged in to {host} as {user["login"]}, token saved to {CREDENTIALS_PATH}')
+    print(f'logged in to {host} ({forge_name}) as {username}, token saved to {CREDENTIALS_PATH}')
 
 
 def run_logout(args: argparse.Namespace) -> None:
@@ -411,61 +649,6 @@ def run_logout(args: argparse.Namespace) -> None:
     print(f'removed saved login for {host}')
 
 
-def github_request(url: str, token: str, exit_on_error: bool = True) -> dict | list | None:
-    headers = {'Accept': 'application/vnd.github+json'}
-    if token:
-        headers['Authorization'] = f'Bearer {token}'
-    request = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(request, timeout=15) as response:
-            return json.loads(response.read().decode('utf-8'))
-    except urllib.error.HTTPError as err:
-        if exit_on_error:
-            sys.exit(f'github api error for {url}: {err.code} {err.reason}')
-        return None
-    except urllib.error.URLError as err:
-        if exit_on_error:
-            sys.exit(f'failed to reach github api: {err.reason}')
-        return None
-
-
-def parse_account_target(target: str) -> tuple[str, str]:
-    if '://' not in target:
-        first_segment = target.partition('/')[0]
-        if '.' not in first_segment:
-            return GITHUB_HOST, first_segment
-        target = f'https://{target}'
-
-    parsed = urllib.parse.urlparse(target)
-    parts = [part for part in parsed.path.split('/') if part]
-    if not parts:
-        sys.exit(f'no account found in: {target}, expected format: https://<host>/<account>')
-    return parsed.netloc, parts[0]
-
-
-def resolve_account_type(api: str, name: str, token: str) -> str:
-    data = github_request(f'{api}/users/{name}', token)
-    return data.get('type', 'User')
-
-
-def list_remote_repos(api: str, name: str, token: str) -> list[RemoteRepo]:
-    account_type = resolve_account_type(api, name, token)
-    endpoint = 'orgs' if account_type == 'Organization' else 'users'
-
-    repos = []
-    page = 1
-    while True:
-        url = f'{api}/{endpoint}/{name}/repos?per_page=100&page={page}'
-        batch = github_request(url, token)
-        if not batch:
-            break
-        repos.extend(RemoteRepo(r['name'], r['clone_url'], r['ssh_url'], r['fork'], r['archived']) for r in batch)
-        if len(batch) < 100:
-            break
-        page += 1
-    return repos
-
-
 def filter_repos(repos: list[RemoteRepo], include_forks: bool, include_archived: bool) -> list[RemoteRepo]:
     result = []
     for repo in repos:
@@ -477,38 +660,38 @@ def filter_repos(repos: list[RemoteRepo], include_forks: bool, include_archived:
     return result
 
 
-def clone_env(token: str, use_ssh: bool) -> dict[str, str]:
-    if not token or use_ssh:
+def clone_env(forge: Forge, use_ssh: bool) -> dict[str, str]:
+    if not forge.token or use_ssh:
         return GIT_ENV
-    credentials = base64.b64encode(f'x-access-token:{token}'.encode()).decode()
     return GIT_ENV | {
         'GIT_CONFIG_COUNT': '1',
         'GIT_CONFIG_KEY_0': 'http.extraheader',
-        'GIT_CONFIG_VALUE_0': f'Authorization: basic {credentials}',
+        'GIT_CONFIG_VALUE_0': forge.git_auth_header(),
     }
 
 
-def clone_repo(repo: RemoteRepo, dest_dir: pathlib.Path, use_ssh: bool, token: str) -> str:
+def clone_repo(repo: RemoteRepo, dest_dir: pathlib.Path, forge: Forge, use_ssh: bool) -> str:
     dest_path = dest_dir / repo.name
     if dest_path.exists():
         return f'skipped (already exists): {repo.name}'
 
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
     url = repo.ssh_url if use_ssh else repo.clone_url
     result = subprocess.run(
         ['git', 'clone', '--quiet', url, str(dest_path)],
         capture_output=True,
         text=True,
-        env=clone_env(token, use_ssh),
+        env=clone_env(forge, use_ssh),
     )
     if result.returncode != 0:
         return f'failed: {repo.name}: {first_error_line(result.stderr)}'
     return f'cloned: {repo.name}'
 
 
-def clone_all(repos: list[RemoteRepo], dest_dir: pathlib.Path, use_ssh: bool, token: str, workers: int) -> list[str]:
+def clone_all(repos: list[RemoteRepo], dest_dir: pathlib.Path, forge: Forge, use_ssh: bool, workers: int) -> list[str]:
     dest_dir.mkdir(parents=True, exist_ok=True)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(clone_repo, repo, dest_dir, use_ssh, token) for repo in repos]
+        futures = [executor.submit(clone_repo, repo, dest_dir, forge, use_ssh) for repo in repos]
         return [future.result() for future in futures]
 
 
@@ -524,96 +707,46 @@ def print_clone_results(results: list[str]) -> None:
 
 
 def run_clone(args: argparse.Namespace) -> None:
-    host, account = parse_account_target(args.target)
-    token = resolve_token(args.token, host)
+    host, parts = split_target(args.target)
+    if not parts:
+        sys.exit(f'no account found in: {args.target}, expected format: https://<host>/<account>')
+    forge = open_forge(host, args.token)
+    account = forge.account_from_path(parts)
 
     print(f'looking up repositories for {account} on {host}')
-    repos = list_remote_repos(api_base(host), account, token)
-    repos = filter_repos(repos, args.include_forks, args.include_archived)
+    repos = filter_repos(forge.list_repos(account), args.include_forks, args.include_archived)
     if not repos:
         sys.exit('no repositories found')
 
     dest_dir = args.dest or pathlib.Path(account)
     print(f'cloning {len(repos)} repositories into {dest_dir}')
-    results = clone_all(repos, dest_dir, args.ssh, token, args.workers)
+    results = clone_all(repos, dest_dir, forge, args.ssh, args.workers)
     print_clone_results(results)
 
 
-def parse_github_url(url: str) -> tuple[str, str, str, str, str]:
-    trimmed = url.rstrip('/')
-    if '://' not in trimmed:
-        trimmed = f'https://{trimmed}'
-    parsed = urllib.parse.urlparse(trimmed)
-
-    parts = parsed.path.strip('/').split('/')
-    if len(parts) < 3:
-        sys.exit('expected format: https://<host>/owner/repo/tree/branch/path/to/folder or .../blob/branch/path/to/file')
-
-    owner = parts[0]
-    repo = parts[1]
-    if parts[2] in ('tree', 'blob') and len(parts) > 3:
-        branch = parts[3]
-        path = '/'.join(parts[4:]) if len(parts) > 4 else ''
-    else:
-        branch = ''
-        path = '/'.join(parts[2:])
-
-    if not path:
-        sys.exit('no folder or file path found in url')
-    return parsed.netloc, owner, repo, path, branch
-
-
-def resolve_branch(api: str, owner: str, repo: str, branch: str, token: str) -> str:
-    if branch:
-        return branch
-    data = github_request(f'{api}/repos/{owner}/{repo}', token)
-    return data.get('default_branch', 'main')
-
-
-def contents_url(api: str, owner: str, repo: str, path: str, branch: str) -> str:
-    return f'{api}/repos/{owner}/{repo}/contents/{path}?ref={branch}'
-
-
-def download_file(url: str, destination: pathlib.Path, token: str) -> bool:
-    headers = {'Authorization': f'Bearer {token}'} if token else {}
-    request = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(response.read())
-        return True
-    except (urllib.error.HTTPError, urllib.error.URLError, OSError) as err:
-        print(f'failed to download {destination}: {err}', file=sys.stderr)
-        return False
-
-
 def download_folder(
-    api: str,
-    owner: str,
-    repo: str,
-    folder_path: str,
+    forge: Forge,
+    project: str,
+    ref: str,
+    folder: str,
     destination: pathlib.Path,
-    branch: str,
-    token: str,
     executor: concurrent.futures.ThreadPoolExecutor,
 ) -> bool:
-    contents = github_request(contents_url(api, owner, repo, folder_path, branch), token, exit_on_error=False)
-    if not isinstance(contents, list):
-        print(f'could not fetch folder contents: {folder_path}', file=sys.stderr)
+    entries = forge.list_dir(project, folder, ref)
+    if entries is None:
+        print(f'could not fetch folder contents: {folder}', file=sys.stderr)
         return False
 
     destination.mkdir(parents=True, exist_ok=True)
     success = True
     futures = []
-    for item in contents:
-        if item['type'] == 'dir':
-            sub_path = f'{folder_path}/{item["name"]}'
-            sub_dest = destination / item['name']
-            if not download_folder(api, owner, repo, sub_path, sub_dest, branch, token, executor):
+    for entry in entries:
+        if entry.is_dir:
+            if not download_folder(forge, project, ref, entry.path, destination / entry.name, executor):
                 success = False
-        elif item['type'] == 'file':
-            print(f'downloading {item["path"]}')
-            futures.append(executor.submit(download_file, item['download_url'], destination / item['name'], token))
+        else:
+            print(f'downloading {entry.path}')
+            futures.append(executor.submit(download_file, entry.download_url, destination / entry.name, forge.api_headers()))
 
     for future in concurrent.futures.as_completed(futures):
         if not future.result():
@@ -622,26 +755,28 @@ def download_folder(
 
 
 def run_fetch(args: argparse.Namespace) -> None:
-    host, owner, repo, path, branch = parse_github_url(args.url)
-    token = resolve_token(args.token, host)
-    api = api_base(host)
-    branch = resolve_branch(api, owner, repo, branch, token)
+    host, parts = split_target(args.url)
+    forge = open_forge(host, args.token)
+    project, ref, path = forge.parse_url(parts)
+    ref = ref or forge.default_branch(project)
 
     dest_path = args.dest or pathlib.Path(path.split('/')[-1])
     if dest_path.exists():
         sys.exit(f'destination already exists: {dest_path}')
 
-    contents = github_request(contents_url(api, owner, repo, path, branch), token)
-    if isinstance(contents, dict) and contents.get('type') == 'file':
-        print(f'fetching {owner}/{repo}/{path} from {branch}')
-        if not download_file(contents['download_url'], dest_path, token):
+    entry = forge.describe(project, path, ref)
+    if entry is None:
+        sys.exit(f'not found: {path} on {ref} in {project}')
+
+    print(f'fetching {project}/{path} from {ref}')
+    if not entry.is_dir:
+        if not download_file(entry.download_url, dest_path, forge.api_headers()):
             sys.exit(f'failed to download file: {path}')
         print(f'fetched to: {dest_path}')
         return
 
-    print(f'fetching {owner}/{repo}/{path} from {branch}')
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
-        success = download_folder(api, owner, repo, path, dest_path, branch, token, executor)
+        success = download_folder(forge, project, ref, path, dest_path, executor)
 
     if not success:
         sys.exit(f'some files failed to download, see {dest_path}')
@@ -947,10 +1082,10 @@ def add_status_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def add_clone_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser('clone', help='clone every repository from a github user or org')
+    parser = subparsers.add_parser('clone', help='clone every repository from a github or gitlab user, org, or group')
     parser.add_argument(
         'target',
-        help='github username, org name, or profile url, e.g. octocat, https://github.com/octocat, or https://ghe.example.com/acme',
+        help='account name or profile url, e.g. octocat, https://github.com/octocat, https://gitlab.com/group/subgroup',
     )
     parser.add_argument('--dest', type=pathlib.Path, default=None, help='destination directory, default is ./<account>')
     parser.add_argument('--ssh', action='store_true', help='clone over ssh instead of https')
@@ -960,16 +1095,16 @@ def add_clone_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         '--token',
         default='',
-        help='github token for private repos and higher rate limits, default is the saved gb login for the host, then GITHUB_TOKEN env var',
+        help='one-off token for private repos and higher rate limits, overrides the saved login for this run only',
     )
     parser.set_defaults(func=run_clone)
 
 
 def add_fetch_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser('fetch', help='download a single file or folder from a github repo, no full clone')
+    parser = subparsers.add_parser('fetch', help='download a single file or folder from a repo, no full clone')
     parser.add_argument(
         'url',
-        help='github url to a file or folder, e.g. https://github.com/owner/repo/tree/main/path or .../blob/main/file.py',
+        help='url to a file or folder, e.g. https://github.com/owner/repo/tree/main/path or https://gitlab.com/group/project/-/blob/main/file.py',
     )
     parser.add_argument(
         '--dest', type=pathlib.Path, default=None, help='destination directory, default is the folder name'
@@ -978,7 +1113,7 @@ def add_fetch_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         '--token',
         default='',
-        help='github token for private repos and higher rate limits, default is the saved gb login for the host, then GITHUB_TOKEN env var',
+        help='one-off token for private repos and higher rate limits, overrides the saved login for this run only',
     )
     parser.set_defaults(func=run_fetch)
 
@@ -1029,19 +1164,25 @@ def add_stale_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def add_login_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser('login', help='log in through the browser and save a token for a github host')
-    parser.add_argument('host', nargs='?', default=GITHUB_HOST, help='github host to log in to, default is github.com')
+    parser = subparsers.add_parser('login', help='save an access token for a git host')
+    parser.add_argument('host', nargs='?', default=GITHUB_HOST, help='host to log in to, default is github.com')
     parser.add_argument(
-        '--client-id',
-        default='',
-        help='oauth app client id with device flow enabled, falls back to GB_CLIENT_ID env var',
+        '--forge',
+        choices=sorted(FORGE_TYPES),
+        default=None,
+        help='type of host, only needed for hosts other than github.com and gitlab.com',
+    )
+    parser.add_argument(
+        '--with-token',
+        action='store_true',
+        help='read the token from stdin instead of prompting, e.g. gb login --with-token < token.txt',
     )
     parser.set_defaults(func=run_login)
 
 
 def add_logout_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser('logout', help='remove the saved token for a github host')
-    parser.add_argument('host', nargs='?', default=GITHUB_HOST, help='github host to log out of, default is github.com')
+    parser = subparsers.add_parser('logout', help='remove the saved token for a git host')
+    parser.add_argument('host', nargs='?', default=GITHUB_HOST, help='host to log out of, default is github.com')
     parser.set_defaults(func=run_logout)
 
 
