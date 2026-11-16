@@ -1,4 +1,7 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = "==3.13.*"
+# ///
 
 import argparse
 import dataclasses
@@ -580,7 +583,7 @@ class DevEnvironmentConfig:
                 env=[{'PATH': '$HOME/.local/bin:$PATH'}],
                 version='0.7.9',
                 setup_template=[
-                    'curl -LsSf https://astral.sh/uv/<%>version/install.sh | sh && uv python install 3.11 3.13'
+                    'curl -LsSf https://astral.sh/uv/<%>version/install.sh | sh && uv python install 3.13'
                 ],
             ),
             'node': ToolWithArch(
@@ -624,7 +627,7 @@ class DevEnvironmentConfig:
             ),
             'ipython': Tool(
                 depends_on=['python'],
-                setup_template=['uv tool install --python 3.11 ipython'],
+                setup_template=['uv tool install --python 3.13 ipython'],
             ),
             'neovim': ToolWithArch(
                 depends_on=['curl', 'tar', 'dotfiles'],

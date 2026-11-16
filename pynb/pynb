@@ -1,4 +1,7 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = "==3.13.*"
+# ///
 
 import argparse
 import json
@@ -13,7 +16,7 @@ DEFAULT_CONFIG = {
     'profiles': {
         'default': {
             'directory': '~/notebooks',
-            'python_version': '3.11',
+            'python_version': '3.13',
             'dependencies': [
                 'pandas==2.2.3',
                 'numpy==2.1.2',
@@ -88,7 +91,7 @@ def create_notebook_project(profile: str, folder_name: str) -> None:
     profile_config = config['profiles'][profile]
     base_dir = expand_path(profile_config['directory'])
     project_dir = base_dir / folder_name
-    python_version = profile_config.get('python_version', '3.11')
+    python_version = profile_config.get('python_version', '3.13')
     dependencies = profile_config.get('dependencies', [])
     cells = profile_config.get('cells', [[]])
 
@@ -223,12 +226,12 @@ Commands:
 Profiles:
   Profiles are defined in ~/.dotfiles/.pynb.json and specify:
   - directory: Base directory for notebook projects
-  - python_version: Python version to use (e.g., 3.11)
+  - python_version: Python version to use (e.g., 3.13)
   - dependencies: List of packages to install (pandas, numpy, etc.)
   - cells: Initial code cells to include in the notebook
 
 Default Profile:
-  The 'default' profile creates projects in ~/notebooks with Python 3.11
+  The 'default' profile creates projects in ~/notebooks with Python 3.13
   and common data science packages (pandas, numpy, matplotlib, requests)
 
 Examples:
@@ -275,7 +278,7 @@ Configuration:
 
 
 if __name__ == '__main__':
-    if sys.version_info < (3, 11):
-        print('error: this script requires Python 3.11 or later')
+    if sys.version_info < (3, 13):
+        print('error: this script requires Python 3.13 or later')
         sys.exit(1)
     main()

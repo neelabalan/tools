@@ -1,4 +1,7 @@
-#!/usr/bin/env python3.11
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = "==3.13.*"
+# ///
 
 """
 px - a tiny multi-language project runner.
@@ -146,7 +149,7 @@ class PythonHandler(LanguageHandler):
             print('pyproject.toml is already found at root')
             return
         result = subprocess.run(
-            ['uv', 'init', '--bare', '--python', '3.11'], cwd=self.dir, capture_output=CAPTURE_OUTPUT
+            ['uv', 'init', '--bare', '--python', '3.13'], cwd=self.dir, capture_output=CAPTURE_OUTPUT
         )
         if result.returncode != 0:
             err = f': {result.stderr.decode()}' if result.stderr else ''
