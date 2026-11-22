@@ -26,6 +26,7 @@ import typing
 import kdl
 
 CACHE_DIR = pathlib.Path.home() / '.cache' / 'dnv'
+SSH_TOOLS = frozenset({'dotfiles'})
 
 
 class ContainerEngine:
@@ -354,6 +355,9 @@ class DevEnvironmentConfig:
 
         return all_tools
 
+    def needs_ssh(self) -> bool:
+        return self.ssh and any(name in SSH_TOOLS for name in self.conf)
+
     def _resolve_step(self, pkg: DistroConfig, spec: ToolSpec, kind: str, value: str, effective_arch: str) -> str:
         match kind:
             case 'script':
@@ -453,7 +457,13 @@ class DockerfileBuilder:
             buf.write('\n')
 
         if tool.setup:
-            mount = '--mount=type=ssh ' if self.ssh else ''
+            mount = ''
+            if self.ssh and name in SSH_TOOLS:
+                ssh_dir = f'/home/{self.config.username}/.ssh'
+                mount = (
+                    f'--mount=type=secret,id=ssh_key,target={ssh_dir}/id_ed25519,uid=1000,gid=1000,mode=0400 '
+                    f'--mount=type=secret,id=known_hosts,target={ssh_dir}/known_hosts,uid=1000,gid=1000,mode=0400 '
+                )
             for setup_cmd in tool.setup:
                 buf.write(f'RUN {mount}{normalize_indent_after_first_line(setup_cmd)}\n')
             buf.write('\n')
@@ -679,7 +689,15 @@ class ImageBuilder:
             build_cmd.extend(get_docker_platform_flag(self.arch))
 
         if self.ssh:
-            build_cmd.extend(['--ssh', 'default'])
+            key = pathlib.Path(os.environ.get('DNV_SSH_KEY', '~/.ssh/id_ed25519')).expanduser()
+            known_hosts = pathlib.Path('~/.ssh/known_hosts').expanduser()
+            for path in (key, known_hosts):
+                if not path.is_file():
+                    logger.error(f'ssh secret not found: {path} (set DNV_SSH_KEY to override the key path)')
+                    return False
+            build_cmd.extend(
+                ['--secret', f'id=ssh_key,src={key}', '--secret', f'id=known_hosts,src={known_hosts}']
+            )
 
         if logger.isEnabledFor(logging.DEBUG):
             build_cmd.extend(['--progress=plain', '--no-cache'])
@@ -889,17 +907,17 @@ class CommandHandler:
         dockerfile_path = get_dockerfile_name(config)
 
         image_name = ImageBuilder.get_image_tag(config)
-        image_builder = ImageBuilder(image_name, dockerfile_path, config.host_arch, ssh=config.ssh)
+        image_builder = ImageBuilder(image_name, dockerfile_path, config.host_arch, ssh=config.needs_ssh())
 
         if self.args.rebuild:
             logger.info(f'rebuilding image: {image_name}...')
-            self.artifact_repo.save_artifact(DockerfileBuilder(config, ssh=config.ssh).build(), dockerfile_path.name)
+            self.artifact_repo.save_artifact(DockerfileBuilder(config, ssh=config.needs_ssh()).build(), dockerfile_path.name)
             if not image_builder.build():
                 logger.error('failed to build image')
                 sys.exit(1)
         elif not image_builder.is_built():
             logger.info(f'image {image_name} not found, building...')
-            self.artifact_repo.save_artifact(DockerfileBuilder(config, ssh=config.ssh).build(), dockerfile_path.name)
+            self.artifact_repo.save_artifact(DockerfileBuilder(config, ssh=config.needs_ssh()).build(), dockerfile_path.name)
             if not image_builder.build():
                 logger.error('failed to build image')
                 sys.exit(1)
@@ -918,10 +936,10 @@ class CommandHandler:
 
         config = DevEnvironmentConfig.from_profile(self.args.profile)
         dockerfile_path = get_dockerfile_name(config)
-        self.artifact_repo.save_artifact(DockerfileBuilder(config, ssh=config.ssh).build(), str(dockerfile_path))
+        self.artifact_repo.save_artifact(DockerfileBuilder(config, ssh=config.needs_ssh()).build(), str(dockerfile_path))
 
         image_name = ImageBuilder.get_image_tag(config)
-        image_builder = ImageBuilder(image_name, dockerfile_path, config.host_arch, ssh=config.ssh)
+        image_builder = ImageBuilder(image_name, dockerfile_path, config.host_arch, ssh=config.needs_ssh())
         if not image_builder.build():
             logger.error('failed to build image')
             sys.exit(1)
@@ -947,7 +965,7 @@ class CommandHandler:
             if not config.current_distro_config.base_image:
                 logger.error(f'distro {config.distro} has no base-image, use --format shell')
                 sys.exit(1)
-            dockerfile_content = DockerfileBuilder(config, ssh=config.ssh).build()
+            dockerfile_content = DockerfileBuilder(config, ssh=config.needs_ssh()).build()
             filename = f'Dockerfile.{config.profile}.{config.distro}.{config.host_arch}'
             saved_path = self.artifact_repo.save_artifact(dockerfile_content, filename)
             logger.info(f'Dockerfile written to: {saved_path}')
