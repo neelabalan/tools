@@ -417,7 +417,7 @@ package "docker" version="28.3.3" {
     }
 }
 
-package "dotsync" version="0.0.2" {
+package "dotsync" version="0.0.4" {
     arch "x86_64" "linux-x86_64"
     arch "aarch64" "linux-aarch64"
     arch "darwin-aarch64" "darwin-aarch64"
