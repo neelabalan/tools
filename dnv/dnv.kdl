@@ -114,7 +114,7 @@ package "node" version="22" {
 package "rust" {
     env "PATH" "$PATH:$HOME/.cargo/bin"
     install {
-        run "curl https://sh.rustup.rs -sSf | bash -s -- -y --no-modify-path"
+        run "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash -s -- -y --no-modify-path"
     }
 }
 
