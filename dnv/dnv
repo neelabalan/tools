@@ -26,7 +26,7 @@ import typing
 import kdl
 
 CACHE_DIR = pathlib.Path.home() / '.cache' / 'dnv'
-SSH_TOOLS = frozenset({'dotfiles'})
+CONTEXT_DIR = CACHE_DIR / 'context'
 
 
 class ContainerEngine:
@@ -67,6 +67,7 @@ class Tool:
     setup: list[str] = dataclasses.field(default_factory=list)
     depends_on: list[str] = dataclasses.field(default_factory=list)
     env: list[dict[str, str]] = dataclasses.field(default_factory=list)
+    copy: list[dict[str, str]] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -75,6 +76,7 @@ class ToolSpec:
     depends_on: list[str]
     arch_map: dict[str, str]
     env: list[dict[str, str]]
+    copy: list[dict[str, str]]
     install: list[tuple[str, str]]
 
 
@@ -154,6 +156,7 @@ def _load_tool(node: kdl.Node) -> ToolSpec:
         depends_on=[name for req in _children(node, 'requires') for name in req.args],
         arch_map={arch.args[0]: arch.args[1] for arch in _children(node, 'arch')},
         env=[{env.args[0]: env.args[1]} for env in _children(node, 'env')],
+        copy=[{'source': c.args[0], 'destination': c.args[1]} for c in _children(node, 'copy')],
         install=[(step.name, step.args[0]) for block in _children(node, 'install') for step in block.nodes],
     )
 
@@ -303,7 +306,6 @@ class DevEnvironmentConfig:
             arch=profile_data['arch'],
             username=profile_data['container_user'],
             profile=profile,
-            ssh=profile_data.get('ssh', True),
         )
 
     def __init__(
@@ -312,13 +314,11 @@ class DevEnvironmentConfig:
         arch: str,
         username: str,
         profile: str | None = None,
-        ssh: bool = True,
     ) -> None:
         self.distro = distro
         self.username = username
         self.profile = profile
         self.host_arch = arch
-        self.ssh = ssh
 
         self._setup_distro_config()
         self.conf = self._generate_conf()
@@ -343,6 +343,7 @@ class DevEnvironmentConfig:
                 setup=[self._resolve_step(pkg, spec, kind, value, effective_arch) for kind, value in spec.install],
                 depends_on=spec.depends_on,
                 env=spec.env,
+                copy=spec.copy,
             )
             for name, spec in self.TOOLS.items()
         }
@@ -355,8 +356,8 @@ class DevEnvironmentConfig:
 
         return all_tools
 
-    def needs_ssh(self) -> bool:
-        return self.ssh and any(name in SSH_TOOLS for name in self.conf)
+    def copies(self) -> list[dict[str, str]]:
+        return [item for tool in self.conf.values() for item in tool.copy]
 
     def _resolve_step(self, pkg: DistroConfig, spec: ToolSpec, kind: str, value: str, effective_arch: str) -> str:
         match kind:
@@ -424,10 +425,9 @@ class DockerfileBuilder:
         RUN echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
     """)
 
-    def __init__(self, config: DevEnvironmentConfig, ssh: bool = True) -> None:
+    def __init__(self, config: DevEnvironmentConfig) -> None:
         self.config = config
         self.tools = config.conf
-        self.ssh = ssh
         self.docker_template = self._setup_docker_template()
 
     def _setup_docker_template(self) -> DockerfileTemplate:
@@ -456,16 +456,15 @@ class DockerfileBuilder:
                     buf.write(f'ENV {key}={val}\n')
             buf.write('\n')
 
+        if tool.copy:
+            buf.write(f'# WARNING: files copied for {name} are baked into this image and can be extracted\n')
+            buf.write(f'# file copy for {name}\n')
+            for copy_item in tool.copy:
+                buf.write(f'COPY --chown=$USERNAME:$USERNAME {copy_item["destination"]} {copy_item["destination"]}\n')
+
         if tool.setup:
-            mount = ''
-            if self.ssh and name in SSH_TOOLS:
-                ssh_dir = f'/home/{self.config.username}/.ssh'
-                mount = (
-                    f'--mount=type=secret,id=ssh_key,target={ssh_dir}/id_ed25519,uid=1000,gid=1000,mode=0400 '
-                    f'--mount=type=secret,id=known_hosts,target={ssh_dir}/known_hosts,uid=1000,gid=1000,mode=0400 '
-                )
             for setup_cmd in tool.setup:
-                buf.write(f'RUN {mount}{normalize_indent_after_first_line(setup_cmd)}\n')
+                buf.write(f'RUN {normalize_indent_after_first_line(setup_cmd)}\n')
             buf.write('\n')
 
         return buf.getvalue()
@@ -587,7 +586,15 @@ class SetupShBuilder:
         return cmd.replace("'", "'\"'\"'")
 
     def build_tool_entry(self, name: str, tool: Tool) -> str:
-        commands = list(tool.setup) or ['true']
+        commands = []
+        for copy_item in tool.copy:
+            destination = f'"$HOME/{copy_item["destination"]}"'
+            commands.append(f'mkdir -p "$(dirname {destination})"')
+            commands.append(f'cp {shlex.quote(str(pathlib.Path(copy_item["source"]).expanduser()))} {destination}')
+        commands.extend(tool.setup)
+
+        if not commands:
+            commands = ['true']
 
         combined = ' && '.join(commands)
         escaped = self._escape_for_bash(combined)
@@ -654,11 +661,17 @@ class ArtifactRepository:
 
 
 class ImageBuilder:
-    def __init__(self, name: str, dockerfile_path: pathlib.Path, arch: str | None = None, ssh: bool = False) -> None:
+    def __init__(
+        self,
+        name: str,
+        dockerfile_path: pathlib.Path,
+        arch: str | None = None,
+        copies: list[dict[str, str]] | None = None,
+    ) -> None:
         self.name = name
         self.dockerfile_path = dockerfile_path
         self.arch = arch
-        self.ssh = ssh
+        self.copies = copies or []
 
     @staticmethod
     def get_image_tag(config: DevEnvironmentConfig) -> str:
@@ -674,7 +687,29 @@ class ImageBuilder:
     def is_built(self) -> bool:
         return self._image_exists(self.name)
 
+    def _stage_context(self) -> None:
+        # WARNING: files listed in `copy` (e.g. ssh keys) are baked into the image layers.
+        # They are staged in CONTEXT_DIR only for the duration of the build and removed after.
+        CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
+        for item in self.copies:
+            target = CONTEXT_DIR / item['destination']
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(pathlib.Path(item['source']).expanduser(), target)
+
     def build(self) -> bool:
+        shutil.rmtree(CONTEXT_DIR, ignore_errors=True)
+        try:
+            self._stage_context()
+        except OSError as e:
+            logger.error(f'failed to stage copy sources: {e}')
+            shutil.rmtree(CONTEXT_DIR, ignore_errors=True)
+            return False
+        try:
+            return self._run_build()
+        finally:
+            shutil.rmtree(CONTEXT_DIR, ignore_errors=True)
+
+    def _run_build(self) -> bool:
         logger.info(f'building image: {self.name}')
 
         build_cmd = ContainerEngine.cmd(
@@ -688,21 +723,10 @@ class ImageBuilder:
         if self.arch:
             build_cmd.extend(get_docker_platform_flag(self.arch))
 
-        if self.ssh:
-            key = pathlib.Path(os.environ.get('DNV_SSH_KEY', '~/.ssh/id_ed25519')).expanduser()
-            known_hosts = pathlib.Path('~/.ssh/known_hosts').expanduser()
-            for path in (key, known_hosts):
-                if not path.is_file():
-                    logger.error(f'ssh secret not found: {path} (set DNV_SSH_KEY to override the key path)')
-                    return False
-            build_cmd.extend(
-                ['--secret', f'id=ssh_key,src={key}', '--secret', f'id=known_hosts,src={known_hosts}']
-            )
-
         if logger.isEnabledFor(logging.DEBUG):
             build_cmd.extend(['--progress=plain', '--no-cache'])
 
-        build_cmd.append(str(CACHE_DIR))
+        build_cmd.append(str(CONTEXT_DIR))
         logger.debug(f'running: {" ".join(build_cmd)}')
 
         artifact_repo = ArtifactRepository()
@@ -713,11 +737,11 @@ class ImageBuilder:
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.info(f'Debug mode: showing verbose {ContainerEngine.engine()} build output...')
-            debug_result = subprocess.run(build_cmd, cwd=str(CACHE_DIR))
+            debug_result = subprocess.run(build_cmd, cwd=str(CONTEXT_DIR))
             returncode = debug_result.returncode
             stdout_output = stderr_output = 'Live output shown above'
         else:
-            text_result = subprocess.run(build_cmd, capture_output=True, text=True, cwd=str(CACHE_DIR))
+            text_result = subprocess.run(build_cmd, capture_output=True, text=True, cwd=str(CONTEXT_DIR))
             returncode = text_result.returncode
             stdout_output = text_result.stdout
             stderr_output = text_result.stderr
@@ -907,17 +931,17 @@ class CommandHandler:
         dockerfile_path = get_dockerfile_name(config)
 
         image_name = ImageBuilder.get_image_tag(config)
-        image_builder = ImageBuilder(image_name, dockerfile_path, config.host_arch, ssh=config.needs_ssh())
+        image_builder = ImageBuilder(image_name, dockerfile_path, config.host_arch, copies=config.copies())
 
         if self.args.rebuild:
             logger.info(f'rebuilding image: {image_name}...')
-            self.artifact_repo.save_artifact(DockerfileBuilder(config, ssh=config.needs_ssh()).build(), dockerfile_path.name)
+            self.artifact_repo.save_artifact(DockerfileBuilder(config).build(), dockerfile_path.name)
             if not image_builder.build():
                 logger.error('failed to build image')
                 sys.exit(1)
         elif not image_builder.is_built():
             logger.info(f'image {image_name} not found, building...')
-            self.artifact_repo.save_artifact(DockerfileBuilder(config, ssh=config.needs_ssh()).build(), dockerfile_path.name)
+            self.artifact_repo.save_artifact(DockerfileBuilder(config).build(), dockerfile_path.name)
             if not image_builder.build():
                 logger.error('failed to build image')
                 sys.exit(1)
@@ -936,10 +960,10 @@ class CommandHandler:
 
         config = DevEnvironmentConfig.from_profile(self.args.profile)
         dockerfile_path = get_dockerfile_name(config)
-        self.artifact_repo.save_artifact(DockerfileBuilder(config, ssh=config.needs_ssh()).build(), str(dockerfile_path))
+        self.artifact_repo.save_artifact(DockerfileBuilder(config).build(), str(dockerfile_path))
 
         image_name = ImageBuilder.get_image_tag(config)
-        image_builder = ImageBuilder(image_name, dockerfile_path, config.host_arch, ssh=config.needs_ssh())
+        image_builder = ImageBuilder(image_name, dockerfile_path, config.host_arch, copies=config.copies())
         if not image_builder.build():
             logger.error('failed to build image')
             sys.exit(1)
@@ -965,7 +989,7 @@ class CommandHandler:
             if not config.current_distro_config.base_image:
                 logger.error(f'distro {config.distro} has no base-image, use --format shell')
                 sys.exit(1)
-            dockerfile_content = DockerfileBuilder(config, ssh=config.needs_ssh()).build()
+            dockerfile_content = DockerfileBuilder(config).build()
             filename = f'Dockerfile.{config.profile}.{config.distro}.{config.host_arch}'
             saved_path = self.artifact_repo.save_artifact(dockerfile_content, filename)
             logger.info(f'Dockerfile written to: {saved_path}')

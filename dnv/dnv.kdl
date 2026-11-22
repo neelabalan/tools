@@ -398,7 +398,12 @@ package "kubectl" version="v1.33.1" {
     }
 }
 
+// WARNING: `copy` bakes the files below into the image layers. Anyone with the image
+// can extract the private key. This is an accepted risk for this package; do not
+// copy secrets into images you share or push to a registry.
 package "ssh" {
+    copy "~/.ssh/id_rsa" ".ssh/id_rsa"
+    copy "~/.ssh/known_hosts" ".ssh/known_hosts"
     install {
         run #"""
             sudo sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && \
@@ -428,7 +433,7 @@ package "dotsync" version="0.0.4" {
 }
 
 package "dotfiles" {
-    requires "dotsync"
+    requires "dotsync" "ssh"
     install {
         run "curl -fsSL https://raw.githubusercontent.com/neelabalan/dotfiles/refs/heads/master/dotsync.json -o $HOME/dotsync.json"
         run "dotsync init --config $HOME/dotsync.json"
@@ -448,57 +453,57 @@ package "cleanup" {
 //
 // profile  distro, arch, user, ports, volumes, tools
 
-profile "just-dotfiles" distro="alma" arch="x86_64" user="blue" ssh=#true
+profile "just-dotfiles" distro="alma" arch="x86_64" user="blue"
 
-profile "workstation" distro="alma" arch="x86_64" user="blue" ssh=#true {
+profile "workstation" distro="alma" arch="x86_64" user="blue" {
     volume source="~/.ssh" target="/home/blue/.ssh" mode="ro"
     tools "python" "node" "rust" "go" "sdkman" "neovim" "starship" "fzf" "ripgrep" "tokei" "eza" \
         "kubectl" "ipython" "ranger" "ssh" "docker" "dotfiles"
 }
 
-profile "workstation-arm" distro="alma" arch="aarch64" user="blue" ssh=#true {
+profile "workstation-arm" distro="alma" arch="aarch64" user="blue" {
     volume source="~/.ssh" target="/home/blue/.ssh" mode="ro"
     tools "python" "node" "rust" "go" "sdkman" "neovim" "starship" "fzf" "ripgrep" "tokei" "eza" \
         "kubectl" "ipython" "ranger" "ssh" "docker" "dotfiles"
 }
 
-profile "python-minimal" distro="alma" arch="x86_64" user="blue" ssh=#true {
+profile "python-minimal" distro="alma" arch="x86_64" user="blue" {
     expose 8000
     volume source="~/code" target="/home/blue/code" mode="rw"
     tools "python" "fzf" "ripgrep" "ipython" "dotfiles"
 }
 
-profile "python-minimal-arm" distro="alma" arch="aarch64" user="blue" ssh=#true {
+profile "python-minimal-arm" distro="alma" arch="aarch64" user="blue" {
     expose 8000
     volume source="~/code" target="/home/blue/code" mode="rw"
     tools "python" "fzf" "ripgrep" "ipython" "dotfiles"
 }
 
-profile "ml-cuda" distro="cuda" arch="x86_64" user="developer" ssh=#true {
+profile "ml-cuda" distro="cuda" arch="x86_64" user="developer" {
     working-directory "/home/developer/workspace"
     volume source="./ml-workspace" target="/home/developer/workspace" mode="rw"
     tools "python" "starship" "neovim" "dotfiles"
 }
 
-profile "workstation-minimal" distro="alma-minimal" arch="x86_64" user="blue" ssh=#true {
+profile "workstation-minimal" distro="alma-minimal" arch="x86_64" user="blue" {
     volume source="~/.ssh" target="/home/blue/.ssh" mode="ro"
     tools "python" "rust" "go" "neovim" "starship" "fzf" "ripgrep" "eza" "ipython" "ranger" "ssh" \
         "dotfiles"
 }
 
-profile "ws-deb" distro="debian" arch="x86_64" user="blue" ssh=#true {
+profile "ws-deb" distro="debian" arch="x86_64" user="blue" {
     volume source="~/.ssh" target="/home/blue/.ssh" mode="ro"
     tools "python" "node" "rust" "go" "sdkman" "neovim" "starship" "fzf" "ripgrep" "tokei" "eza" \
         "kubectl" "ipython" "ranger" "ssh" "docker" "dotfiles"
 }
 
-profile "ws-deb-arm" distro="debian" arch="aarch64" user="blue" ssh=#true {
+profile "ws-deb-arm" distro="debian" arch="aarch64" user="blue" {
     volume source="~/.ssh" target="/home/blue/.ssh" mode="ro"
     tools "python" "node" "rust" "go" "sdkman" "neovim" "starship" "fzf" "ripgrep" "tokei" "eza" \
         "kubectl" "ipython" "ranger" "ssh" "docker" "dotfiles"
 }
 
-profile "macos" distro="darwin" arch="aarch64" user="" ssh=#true {
+profile "macos" distro="darwin" arch="aarch64" user="" {
     tools "python" "node" "rust" "go" "sdkman" "neovim" "starship" "fzf" "ripgrep" "tokei" "eza" \
         "bat" "fd" "btop" "age" "jq" "yq" "helm" "hurl" "zoxide" "yazi" "typst" "tree-sitter" \
         "kubectl" "ipython" "ranger" "dotfiles"
