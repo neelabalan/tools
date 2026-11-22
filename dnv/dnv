@@ -66,7 +66,6 @@ class Tool:
     setup: list[str] = dataclasses.field(default_factory=list)
     depends_on: list[str] = dataclasses.field(default_factory=list)
     env: list[dict[str, str]] = dataclasses.field(default_factory=list)
-    copy: list[dict[str, str]] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -75,7 +74,6 @@ class ToolSpec:
     depends_on: list[str]
     arch_map: dict[str, str]
     env: list[dict[str, str]]
-    copy: list[dict[str, str]]
     install: list[tuple[str, str]]
 
 
@@ -155,7 +153,6 @@ def _load_tool(node: kdl.Node) -> ToolSpec:
         depends_on=[name for req in _children(node, 'requires') for name in req.args],
         arch_map={arch.args[0]: arch.args[1] for arch in _children(node, 'arch')},
         env=[{env.args[0]: env.args[1]} for env in _children(node, 'env')],
-        copy=[{'source': c.args[0], 'destination': c.args[0]} for c in _children(node, 'copy')],
         install=[(step.name, step.args[0]) for block in _children(node, 'install') for step in block.nodes],
     )
 
@@ -342,7 +339,6 @@ class DevEnvironmentConfig:
                 setup=[self._resolve_step(pkg, spec, kind, value, effective_arch) for kind, value in spec.install],
                 depends_on=spec.depends_on,
                 env=spec.env,
-                copy=spec.copy,
             )
             for name, spec in self.TOOLS.items()
         }
@@ -451,11 +447,6 @@ class DockerfileBuilder:
                 for key, val in env_item.items():
                     buf.write(f'ENV {key}={val}\n')
             buf.write('\n')
-
-        if tool.copy:
-            buf.write(f'# file copy for {name}\n')
-            for copy_item in tool.copy:
-                buf.write(f'COPY --chown=$USERNAME:$USERNAME {copy_item["source"]} {copy_item["destination"]}\n')
 
         if tool.setup:
             for setup_cmd in tool.setup:
@@ -581,17 +572,7 @@ class SetupShBuilder:
         return cmd.replace("'", "'\"'\"'")
 
     def build_tool_entry(self, name: str, tool: Tool) -> str:
-        commands = []
-        if tool.copy:
-            for f in tool.copy:
-                commands.append(f'mkdir -p $(dirname {shlex.quote(f["destination"])})')
-                commands.append(f'cp {shlex.quote(f["source"])} {shlex.quote(f["destination"])}')
-        if tool.setup:
-            for cmd in tool.setup:
-                commands.append(cmd)
-
-        if not commands:
-            commands = ['true']
+        commands = list(tool.setup) or ['true']
 
         combined = ' && '.join(commands)
         escaped = self._escape_for_bash(combined)

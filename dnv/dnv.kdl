@@ -429,8 +429,8 @@ package "dotsync" version="0.0.2" {
 
 package "dotfiles" {
     requires "dotsync"
-    copy "dotsync.json"
     install {
+        run "curl -fsSL https://raw.githubusercontent.com/neelabalan/dotfiles/refs/heads/master/dotsync.json -o $HOME/dotsync.json"
         run "dotsync init --config $HOME/dotsync.json"
         run "dotsync setup --profile $profile"
     }
