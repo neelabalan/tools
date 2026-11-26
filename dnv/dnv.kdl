@@ -422,6 +422,12 @@ package "docker" version="28.3.3" {
     }
 }
 
+package "llama.cpp" {
+    install {
+        run "curl -LsSf https://llama.app/install.sh | sh"
+    }
+}
+
 package "dotsync" version="0.0.4" {
     arch "x86_64" "linux-x86_64"
     arch "aarch64" "linux-aarch64"
@@ -451,7 +457,9 @@ package "cleanup" {
 
 // profiles: named environments built from the distros and packages above
 //
-// profile  distro, arch, user, ports, volumes, tools
+// profile  distro, arch, user, ports, volumes, tools, run-args, build-device
+//   run-args       additional container runtime arguments
+//   build-device   CDI device exposed to install steps during the image build
 
 profile "just-dotfiles" distro="alma" arch="x86_64" user="blue"
 
@@ -459,6 +467,13 @@ profile "workstation" distro="alma" arch="x86_64" user="blue" {
     volume source="~/.ssh" target="/home/blue/.ssh" mode="ro"
     tools "python" "node" "rust" "go" "sdkman" "neovim" "starship" "fzf" "ripgrep" "tokei" "eza" \
         "kubectl" "ipython" "ranger" "ssh" "docker" "dotfiles"
+}
+
+profile "workstation-gpu" distro="cuda" arch="x86_64" user="blue" {
+    volume source="~/.ssh" target="/home/blue/.ssh" mode="ro"
+    build-device "nvidia.com/gpu=all"
+    tools "python" "node" "rust" "go" "sdkman" "neovim" "starship" "fzf" "ripgrep" "tokei" "eza" \
+        "kubectl" "ipython" "ranger" "ssh" "docker" "dotfiles" "llama.cpp"
 }
 
 profile "workstation-arm" distro="alma" arch="aarch64" user="blue" {

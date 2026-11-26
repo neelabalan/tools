@@ -68,6 +68,7 @@ class Tool:
     depends_on: list[str] = dataclasses.field(default_factory=list)
     env: list[dict[str, str]] = dataclasses.field(default_factory=list)
     copy: list[dict[str, str]] = dataclasses.field(default_factory=list)
+    build_devices: list[str] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -175,6 +176,10 @@ def _load_profile(node: kdl.Node) -> dict[str, typing.Any]:
                 profile['working_directory'] = child.args[0]
             case 'tools':
                 profile.setdefault('tools', []).extend(child.args)
+            case 'run-args':
+                profile.setdefault('run_args', []).extend(str(arg) for arg in child.args)
+            case 'build-device':
+                profile.setdefault('build_devices', []).extend(str(arg) for arg in child.args)
             case _:
                 raise ValueError(f'unknown profile field: {child.name}')
     return profile
@@ -344,6 +349,7 @@ class DevEnvironmentConfig:
                 depends_on=spec.depends_on,
                 env=spec.env,
                 copy=spec.copy,
+                build_devices=self.get_profile_data().get('build_devices', []),
             )
             for name, spec in self.TOOLS.items()
         }
@@ -464,7 +470,8 @@ class DockerfileBuilder:
 
         if tool.setup:
             for setup_cmd in tool.setup:
-                buf.write(f'RUN {normalize_indent_after_first_line(setup_cmd)}\n')
+                device_flags = ''.join(f' --device={device}' for device in tool.build_devices)
+                buf.write(f'RUN{device_flags} {normalize_indent_after_first_line(setup_cmd)}\n')
             buf.write('\n')
 
         return buf.getvalue()
@@ -473,7 +480,10 @@ class DockerfileBuilder:
         stages = []
         for name, tool in self.tools.items():
             stages.append(self.build_tool_stage(name, tool))
-        return self.docker_template.substitute(tool_stages='\n'.join(stages))
+        dockerfile = self.docker_template.substitute(tool_stages='\n'.join(stages))
+        if any(tool.build_devices for tool in self.tools.values()):
+            return '# syntax=docker/dockerfile:1-labs\n\n' + dockerfile
+        return dockerfile
 
 
 class SetupShBuilder:
@@ -667,11 +677,13 @@ class ImageBuilder:
         dockerfile_path: pathlib.Path,
         arch: str | None = None,
         copies: list[dict[str, str]] | None = None,
+        allow_build_device: bool = False,
     ) -> None:
         self.name = name
         self.dockerfile_path = dockerfile_path
         self.arch = arch
         self.copies = copies or []
+        self.allow_build_device = allow_build_device
 
     @staticmethod
     def get_image_tag(config: DevEnvironmentConfig) -> str:
@@ -712,8 +724,14 @@ class ImageBuilder:
     def _run_build(self) -> bool:
         logger.info(f'building image: {self.name}')
 
+        if self.allow_build_device and ContainerEngine.engine() != 'docker':
+            logger.error('build-time devices require Docker Buildx with BuildKit CDI support')
+            return False
+
+        build_subcommand = ['buildx', 'build'] if self.allow_build_device else ['build']
         build_cmd = ContainerEngine.cmd(
-            'build',
+            *build_subcommand,
+            *(('--allow', 'device', '--load') if self.allow_build_device else ()),
             '-t',
             self.name,
             '-f',
@@ -724,7 +742,14 @@ class ImageBuilder:
             build_cmd.extend(get_docker_platform_flag(self.arch))
 
         if logger.isEnabledFor(logging.DEBUG):
-            build_cmd.extend(['--progress=plain', '--no-cache'])
+            build_cmd.append('--progress=plain')
+            if not self.allow_build_device:
+                build_cmd.append('--no-cache')
+
+        if self.allow_build_device:
+            # The llama installer selects a binary from the visible GPU; don't reuse
+            # a cached result that may have been selected on a different build host.
+            build_cmd.append('--no-cache')
 
         build_cmd.append(str(CONTEXT_DIR))
         logger.debug(f'running: {" ".join(build_cmd)}')
@@ -804,6 +829,9 @@ class DevContainerManager:
             target = volume['target']
             mode = volume.get('mode', 'rw')
             cmd.extend(['-v', f'{source}:{target}:{mode}'])
+
+        cmd.extend(docker_config.get('run_args', []))
+
         cmd.append(image_name)
         cmd.append('bash')
         logger.info(f'starting container: {" ".join(cmd)}')
@@ -931,7 +959,13 @@ class CommandHandler:
         dockerfile_path = get_dockerfile_name(config)
 
         image_name = ImageBuilder.get_image_tag(config)
-        image_builder = ImageBuilder(image_name, dockerfile_path, config.host_arch, copies=config.copies())
+        image_builder = ImageBuilder(
+            image_name,
+            dockerfile_path,
+            config.host_arch,
+            copies=config.copies(),
+            allow_build_device=any(tool.build_devices for tool in config.conf.values()),
+        )
 
         if self.args.rebuild:
             logger.info(f'rebuilding image: {image_name}...')
@@ -963,7 +997,13 @@ class CommandHandler:
         self.artifact_repo.save_artifact(DockerfileBuilder(config).build(), str(dockerfile_path))
 
         image_name = ImageBuilder.get_image_tag(config)
-        image_builder = ImageBuilder(image_name, dockerfile_path, config.host_arch, copies=config.copies())
+        image_builder = ImageBuilder(
+            image_name,
+            dockerfile_path,
+            config.host_arch,
+            copies=config.copies(),
+            allow_build_device=any(tool.build_devices for tool in config.conf.values()),
+        )
         if not image_builder.build():
             logger.error('failed to build image')
             sys.exit(1)
