@@ -65,6 +65,7 @@ class ContainerEngine:
 @dataclasses.dataclass
 class Tool:
     setup: list[str] = dataclasses.field(default_factory=list)
+    setup_uses_build_device: list[bool] = dataclasses.field(default_factory=list)
     depends_on: list[str] = dataclasses.field(default_factory=list)
     env: list[dict[str, str]] = dataclasses.field(default_factory=list)
     copy: list[dict[str, str]] = dataclasses.field(default_factory=list)
@@ -346,6 +347,7 @@ class DevEnvironmentConfig:
         all_tools: dict[str, Tool] = {
             name: Tool(
                 setup=[self._resolve_step(pkg, spec, kind, value, effective_arch) for kind, value in spec.install],
+                setup_uses_build_device=[kind == 'run-with-build-device' for kind, _ in spec.install],
                 depends_on=spec.depends_on,
                 env=spec.env,
                 copy=spec.copy,
@@ -358,6 +360,11 @@ class DevEnvironmentConfig:
             profile_data = self.PROFILES[self.profile]
             tools_to_include = profile_data.get('tools', [])
             resolved_order = resolve_dependencies(all_tools, tools_to_include)
+            uses_build_device = any(
+                any(all_tools[name].setup_uses_build_device) for name in resolved_order
+            )
+            if uses_build_device and not profile_data.get('build_devices'):
+                raise ValueError(f"profile '{self.profile}' uses run-with-build-device but has no build-device")
             return {name: all_tools[name] for name in resolved_order}
 
         return all_tools
@@ -371,7 +378,7 @@ class DevEnvironmentConfig:
                 if value not in pkg.scripts:
                     raise ValueError(f'distro {pkg.name} has no script: {value}')
                 return pkg.scripts[value]
-            case 'run':
+            case 'run' | 'run-with-build-device':
                 arch = spec.arch_map.get(effective_arch, '')
                 return string.Template(value).safe_substitute(
                     version=spec.version, arch=arch, profile=self.profile or ''
@@ -469,8 +476,10 @@ class DockerfileBuilder:
                 buf.write(f'COPY --chown=$USERNAME:$USERNAME {copy_item["destination"]} {copy_item["destination"]}\n')
 
         if tool.setup:
-            for setup_cmd in tool.setup:
-                device_flags = ''.join(f' --device={device}' for device in tool.build_devices)
+            for index, setup_cmd in enumerate(tool.setup):
+                device_flags = ''
+                if tool.setup_uses_build_device[index]:
+                    device_flags = ''.join(f' --device={device}' for device in tool.build_devices)
                 buf.write(f'RUN{device_flags} {normalize_indent_after_first_line(setup_cmd)}\n')
             buf.write('\n')
 
@@ -481,7 +490,7 @@ class DockerfileBuilder:
         for name, tool in self.tools.items():
             stages.append(self.build_tool_stage(name, tool))
         dockerfile = self.docker_template.substitute(tool_stages='\n'.join(stages))
-        if any(tool.build_devices for tool in self.tools.values()):
+        if any(any(tool.setup_uses_build_device) for tool in self.tools.values()):
             return '# syntax=docker/dockerfile:1-labs\n\n' + dockerfile
         return dockerfile
 
@@ -964,7 +973,7 @@ class CommandHandler:
             dockerfile_path,
             config.host_arch,
             copies=config.copies(),
-            allow_build_device=any(tool.build_devices for tool in config.conf.values()),
+            allow_build_device=any(any(tool.setup_uses_build_device) for tool in config.conf.values()),
         )
 
         if self.args.rebuild:
@@ -1002,7 +1011,7 @@ class CommandHandler:
             dockerfile_path,
             config.host_arch,
             copies=config.copies(),
-            allow_build_device=any(tool.build_devices for tool in config.conf.values()),
+            allow_build_device=any(any(tool.setup_uses_build_device) for tool in config.conf.values()),
         )
         if not image_builder.build():
             logger.error('failed to build image')

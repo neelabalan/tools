@@ -73,6 +73,7 @@ distro "darwin" {
 // install steps:
 //   script "name"  distro script (clean)
 //   run "cmd"      shell command; $version, $arch (from the arch map) and $profile are filled in
+//   run-with-build-device "cmd"  run with a profile's build-device attached
 
 package "ranger" {
     requires "python"
@@ -424,7 +425,7 @@ package "docker" version="28.3.3" {
 
 package "llama.cpp" {
     install {
-        run "curl -LsSf https://llama.app/install.sh | sh"
+        run-with-build-device "curl -LsSf https://llama.app/install.sh | sh"
     }
 }
 
@@ -459,7 +460,7 @@ package "cleanup" {
 //
 // profile  distro, arch, user, ports, volumes, tools, run-args, build-device
 //   run-args       additional container runtime arguments
-//   build-device   CDI device exposed to install steps during the image build
+//   build-device   CDI device exposed to steps marked run-with-build-device
 
 profile "just-dotfiles" distro="alma" arch="x86_64" user="blue"
 
