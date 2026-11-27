@@ -460,7 +460,7 @@ package "cleanup" {
 //
 // profile  distro, arch, user, ports, volumes, tools, run-args, build-device
 //   run-args       additional container runtime arguments
-//   build-device   CDI device exposed to steps marked run-with-build-device
+//   build-device   CDI selector for marked steps (Podman passes it to the build globally)
 
 profile "just-dotfiles" distro="alma" arch="x86_64" user="blue"
 
@@ -470,7 +470,7 @@ profile "workstation" distro="alma" arch="x86_64" user="blue" {
         "kubectl" "ipython" "ranger" "ssh" "docker" "dotfiles"
 }
 
-profile "workstation-gpu" distro="cuda" arch="x86_64" user="blue" {
+profile "workstation-gpu" distro="alma" arch="x86_64" user="blue" {
     volume source="~/.ssh" target="/home/blue/.ssh" mode="ro"
     build-device "nvidia.com/gpu=all"
     tools "python" "node" "rust" "go" "sdkman" "neovim" "starship" "fzf" "ripgrep" "tokei" "eza" \

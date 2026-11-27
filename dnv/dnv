@@ -334,6 +334,14 @@ class DevEnvironmentConfig:
             return self.PROFILES[self.profile]
         return {}
 
+    def build_device_steps(self) -> list[tuple[list[str], str]]:
+        return [
+            (tool.build_devices, command)
+            for tool in self.conf.values()
+            for command, uses_device in zip(tool.setup, tool.setup_uses_build_device, strict=True)
+            if uses_device
+        ]
+
     def _setup_distro_config(self) -> None:
         if self.distro not in self.DISTROS:
             raise ValueError(f'unsupported distro: {self.distro}. supported: {list(self.DISTROS.keys())}')
@@ -441,6 +449,7 @@ class DockerfileBuilder:
     def __init__(self, config: DevEnvironmentConfig) -> None:
         self.config = config
         self.tools = config.conf
+        self.engine = ContainerEngine.engine()
         self.docker_template = self._setup_docker_template()
 
     def _setup_docker_template(self) -> DockerfileTemplate:
@@ -477,8 +486,9 @@ class DockerfileBuilder:
 
         if tool.setup:
             for index, setup_cmd in enumerate(tool.setup):
+                uses_build_device = tool.setup_uses_build_device[index]
                 device_flags = ''
-                if tool.setup_uses_build_device[index]:
+                if uses_build_device and self.engine == 'docker':
                     device_flags = ''.join(f' --device={device}' for device in tool.build_devices)
                 buf.write(f'RUN{device_flags} {normalize_indent_after_first_line(setup_cmd)}\n')
             buf.write('\n')
@@ -490,7 +500,9 @@ class DockerfileBuilder:
         for name, tool in self.tools.items():
             stages.append(self.build_tool_stage(name, tool))
         dockerfile = self.docker_template.substitute(tool_stages='\n'.join(stages))
-        if any(any(tool.setup_uses_build_device) for tool in self.tools.values()):
+        if self.engine == 'docker' and any(
+            any(tool.setup_uses_build_device) for tool in self.tools.values()
+        ):
             return '# syntax=docker/dockerfile:1-labs\n\n' + dockerfile
         return dockerfile
 
@@ -686,13 +698,14 @@ class ImageBuilder:
         dockerfile_path: pathlib.Path,
         arch: str | None = None,
         copies: list[dict[str, str]] | None = None,
-        allow_build_device: bool = False,
+        build_device_steps: list[tuple[list[str], str]] | None = None,
     ) -> None:
         self.name = name
         self.dockerfile_path = dockerfile_path
         self.arch = arch
         self.copies = copies or []
-        self.allow_build_device = allow_build_device
+        self.build_device_steps = build_device_steps or []
+        self.engine: str | None = None
 
     @staticmethod
     def get_image_tag(config: DevEnvironmentConfig) -> str:
@@ -733,29 +746,35 @@ class ImageBuilder:
     def _run_build(self) -> bool:
         logger.info(f'building image: {self.name}')
 
-        if self.allow_build_device and ContainerEngine.engine() != 'docker':
-            logger.error('build-time devices require Docker Buildx with BuildKit CDI support')
+        self.engine = ContainerEngine.engine()
+        if self.build_device_steps and self.engine not in {'docker', 'podman'}:
+            logger.error(f'build-time devices are not supported with {self.engine}')
             return False
 
-        build_subcommand = ['buildx', 'build'] if self.allow_build_device else ['build']
-        build_cmd = ContainerEngine.cmd(
-            *build_subcommand,
-            *(('--allow', 'device', '--load') if self.allow_build_device else ()),
-            '-t',
-            self.name,
-            '-f',
-            str(self.dockerfile_path),
-        )
+        build_cmd = ContainerEngine.cmd('build')
+        if self.build_device_steps and self.engine == 'docker':
+            devices = dict.fromkeys(
+                device for step_devices, _ in self.build_device_steps for device in step_devices
+            )
+            for device in devices:
+                build_cmd.extend(['--allow', f'device={device}'])
+        elif self.build_device_steps and self.engine == 'podman':
+            devices = dict.fromkeys(
+                device for step_devices, _ in self.build_device_steps for device in step_devices
+            )
+            for device in devices:
+                build_cmd.extend(['--device', device])
+        build_cmd.extend(['-t', self.name, '-f', str(self.dockerfile_path)])
 
         if self.arch:
             build_cmd.extend(get_docker_platform_flag(self.arch))
 
         if logger.isEnabledFor(logging.DEBUG):
             build_cmd.append('--progress=plain')
-            if not self.allow_build_device:
+            if not self.build_device_steps:
                 build_cmd.append('--no-cache')
 
-        if self.allow_build_device:
+        if self.build_device_steps:
             # The llama installer selects a binary from the visible GPU; don't reuse
             # a cached result that may have been selected on a different build host.
             build_cmd.append('--no-cache')
@@ -786,7 +805,7 @@ class ImageBuilder:
             f'STDOUT:\n{stdout_output}\n'
             f'STDERR:\n{stderr_output}\n'
         )
-        artifact_repo.save_logs(log_content, log_name='docker-build')
+        artifact_repo.save_logs(log_content, log_name='container-build')
 
         if returncode != 0:
             logger.error(f'failed to build image {self.name}: {stderr_output.strip()}')
@@ -973,7 +992,7 @@ class CommandHandler:
             dockerfile_path,
             config.host_arch,
             copies=config.copies(),
-            allow_build_device=any(any(tool.setup_uses_build_device) for tool in config.conf.values()),
+            build_device_steps=config.build_device_steps(),
         )
 
         if self.args.rebuild:
@@ -1011,7 +1030,7 @@ class CommandHandler:
             dockerfile_path,
             config.host_arch,
             copies=config.copies(),
-            allow_build_device=any(any(tool.setup_uses_build_device) for tool in config.conf.values()),
+            build_device_steps=config.build_device_steps(),
         )
         if not image_builder.build():
             logger.error('failed to build image')
