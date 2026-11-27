@@ -65,7 +65,7 @@ distro "cuda" {
 // install steps:
 //   script "name"  distro script (clean)
 //   run "cmd"      shell command; $version, $arch (from the arch map) and $profile are filled in
-//   run-with-build-device "cmd"  run with a profile's build-device attached
+//     with-args    optional Dockerfile RUN arguments (ignored by Podman and host installs)
 
 package "ranger" {
     requires "python"
@@ -417,7 +417,8 @@ package "docker" version="28.3.3" {
 
 package "llama.cpp" {
     install {
-        run-with-build-device "curl -LsSf https://llama.app/install.sh | sh"
+        comment "# syntax=docker/dockerfile:1-labs\n\n"
+        run "curl -LsSf https://llama.app/install.sh | sh" with-args="--device=nvidia.com/gpu=all"
     }
 }
 
@@ -450,9 +451,9 @@ package "cleanup" {
 
 // profiles: named environments built from the distros and packages above
 //
-// profile  distro, arch, user, ports, volumes, tools, run-args, build-device
-//   run-args       additional container runtime arguments
-//   build-device   CDI selector for marked steps (Podman passes it to the build globally)
+// profile  distro, arch, user, ports, volumes, tools, run-args, build-args
+//   run-args       generic runtime args or engine-specific docker/podman args
+//   build-args     generic build args or engine-specific docker/podman args
 
 profile "just-dotfiles" distro="alma" arch="x86_64" user="blue"
 
@@ -464,7 +465,14 @@ profile "workstation" distro="alma" arch="x86_64" user="blue" {
 
 profile "workstation-gpu" distro="alma" arch="x86_64" user="blue" {
     volume source="~/.ssh" target="/home/blue/.ssh" mode="ro"
-    build-device "nvidia.com/gpu=all"
+    build-args "--no-cache" {
+        docker "--allow" "device=nvidia.com/gpu=all"
+        podman "--device" "nvidia.com/gpu=all"
+    }
+    run-args {
+        docker "--gpus" "all"
+        podman "--device" "nvidia.com/gpu=all" "--security-opt=label=disable"
+    }
     tools "python" "node" "rust" "go" "sdkman" "neovim" "starship" "fzf" "ripgrep" "tokei" "eza" \
         "kubectl" "ipython" "ranger" "ssh" "docker" "dotfiles" "llama.cpp"
 }

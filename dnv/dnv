@@ -65,12 +65,10 @@ class ContainerEngine:
 
 @dataclasses.dataclass
 class Tool:
-    setup: list[str] = dataclasses.field(default_factory=list)
-    setup_uses_build_device: list[bool] = dataclasses.field(default_factory=list)
+    setup: list[tuple[str, str, str]] = dataclasses.field(default_factory=list)
     depends_on: list[str] = dataclasses.field(default_factory=list)
     env: list[dict[str, str]] = dataclasses.field(default_factory=list)
     copy: list[dict[str, str]] = dataclasses.field(default_factory=list)
-    build_devices: list[str] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -80,7 +78,7 @@ class ToolSpec:
     arch_map: dict[str, str]
     env: list[dict[str, str]]
     copy: list[dict[str, str]]
-    install: list[tuple[str, str]]
+    install: list[tuple[str, str, str]]
 
 
 @dataclasses.dataclass
@@ -96,13 +94,6 @@ class DistroConfig:
 
     def base_packages(self) -> list[str]:
         return list(self.packages)
-
-    def install(self, *packages: str) -> str:
-        if self.install_cmd is None:
-            return 'true'
-        if not packages:
-            return 'true'
-        return ' '.join(filter(None, [self.install_cmd, *packages, self.install_flags]))
 
     def install_nosudo(self, *packages: str) -> str:
         if self.install_cmd is None:
@@ -160,7 +151,11 @@ def _load_tool(node: kdl.Node) -> ToolSpec:
         arch_map={arch.args[0]: arch.args[1] for arch in _children(node, 'arch')},
         env=[{env.args[0]: env.args[1]} for env in _children(node, 'env')],
         copy=[{'source': c.args[0], 'destination': c.args[1]} for c in _children(node, 'copy')],
-        install=[(step.name, step.args[0]) for block in _children(node, 'install') for step in block.nodes],
+        install=[
+            (step.name, step.args[0], str(step.props.get('with-args', '')))
+            for block in _children(node, 'install')
+            for step in block.nodes
+        ],
     )
 
 
@@ -180,11 +175,30 @@ def _load_profile(node: kdl.Node) -> dict[str, typing.Any]:
                 profile.setdefault('tools', []).extend(child.args)
             case 'run-args':
                 profile.setdefault('run_args', []).extend(str(arg) for arg in child.args)
-            case 'build-device':
-                profile.setdefault('build_devices', []).extend(str(arg) for arg in child.args)
+                for engine_args in child.nodes:
+                    if engine_args.name not in {'docker', 'podman'}:
+                        raise ValueError(f'unknown run-args engine: {engine_args.name}')
+                    profile.setdefault('engine_run_args', {}).setdefault(engine_args.name, []).extend(
+                        str(arg) for arg in engine_args.args
+                    )
+            case 'build-args':
+                profile.setdefault('build_args', []).extend(str(arg) for arg in child.args)
+                for engine_args in child.nodes:
+                    if engine_args.name not in {'docker', 'podman'}:
+                        raise ValueError(f'unknown build-args engine: {engine_args.name}')
+                    profile.setdefault('engine_build_args', {}).setdefault(engine_args.name, []).extend(
+                        str(arg) for arg in engine_args.args
+                    )
             case _:
                 raise ValueError(f'unknown profile field: {child.name}')
     return profile
+
+
+def _profile_engine_args(profile: dict[str, typing.Any], kind: str, engine: str) -> list[str]:
+    return [
+        *profile.get(kind, []),
+        *profile.get(f'engine_{kind}', {}).get(engine, []),
+    ]
 
 
 def load_config(path: pathlib.Path) -> Config:
@@ -335,14 +349,6 @@ class DevEnvironmentConfig:
             return self.PROFILES[self.profile]
         return {}
 
-    def build_device_steps(self) -> list[tuple[list[str], str]]:
-        return [
-            (tool.build_devices, command)
-            for tool in self.conf.values()
-            for command, uses_device in zip(tool.setup, tool.setup_uses_build_device, strict=True)
-            if uses_device
-        ]
-
     def _setup_distro_config(self) -> None:
         if self.distro not in self.DISTROS:
             raise ValueError(f'unsupported distro: {self.distro}. supported: {list(self.DISTROS.keys())}')
@@ -355,12 +361,13 @@ class DevEnvironmentConfig:
 
         all_tools: dict[str, Tool] = {
             name: Tool(
-                setup=[self._resolve_step(pkg, spec, kind, value, effective_arch) for kind, value in spec.install],
-                setup_uses_build_device=[kind == 'run-with-build-device' for kind, _ in spec.install],
+                setup=[
+                    (kind, self._resolve_step(pkg, spec, kind, value, effective_arch), with_args)
+                    for kind, value, with_args in spec.install
+                ],
                 depends_on=spec.depends_on,
                 env=spec.env,
                 copy=spec.copy,
-                build_devices=self.get_profile_data().get('build_devices', []),
             )
             for name, spec in self.TOOLS.items()
         }
@@ -369,11 +376,6 @@ class DevEnvironmentConfig:
             profile_data = self.PROFILES[self.profile]
             tools_to_include = profile_data.get('tools', [])
             resolved_order = resolve_dependencies(all_tools, tools_to_include)
-            uses_build_device = any(
-                any(all_tools[name].setup_uses_build_device) for name in resolved_order
-            )
-            if uses_build_device and not profile_data.get('build_devices'):
-                raise ValueError(f"profile '{self.profile}' uses run-with-build-device but has no build-device")
             return {name: all_tools[name] for name in resolved_order}
 
         return all_tools
@@ -383,11 +385,13 @@ class DevEnvironmentConfig:
 
     def _resolve_step(self, pkg: DistroConfig, spec: ToolSpec, kind: str, value: str, effective_arch: str) -> str:
         match kind:
+            case 'comment':
+                return value
             case 'script':
                 if value not in pkg.scripts:
                     raise ValueError(f'distro {pkg.name} has no script: {value}')
                 return pkg.scripts[value]
-            case 'run' | 'run-with-build-device':
+            case 'run':
                 arch = spec.arch_map.get(effective_arch, '')
                 return string.Template(value).safe_substitute(
                     version=spec.version, arch=arch, profile=self.profile or ''
@@ -423,7 +427,9 @@ class HostPackageInstaller:
                 )
 
             commands: list[str] = []
-            for kind, value in spec.install:
+            for kind, value, _ in spec.install:
+                if kind == 'comment':
+                    continue
                 if kind == 'script':
                     raise ValueError(
                         f'package {name!r} uses a distro-specific script and cannot be installed '
@@ -434,7 +440,7 @@ class HostPackageInstaller:
                         f'package {name!r} requires a profile; profile-based installs are not '
                         'supported by `dnv install`'
                     )
-                if kind not in {'run', 'run-with-build-device'}:
+                if kind != 'run':
                     raise ValueError(f'package {name!r} has unknown install step: {kind}')
                 commands.append(
                     string.Template(value).safe_substitute(version=spec.version, arch=arch)
@@ -581,25 +587,28 @@ class DockerfileBuilder:
                 buf.write(f'COPY --chown=$USERNAME:$USERNAME {copy_item["destination"]} {copy_item["destination"]}\n')
 
         if tool.setup:
-            for index, setup_cmd in enumerate(tool.setup):
-                uses_build_device = tool.setup_uses_build_device[index]
-                device_flags = ''
-                if uses_build_device and self.engine == 'docker':
-                    device_flags = ''.join(f' --device={device}' for device in tool.build_devices)
-                buf.write(f'RUN{device_flags} {normalize_indent_after_first_line(setup_cmd)}\n')
+            for kind, setup_cmd, with_args in tool.setup:
+                if kind == 'comment':
+                    continue
+                docker_args = f'{with_args} ' if self.engine == 'docker' and with_args else ''
+                buf.write(f'RUN {docker_args}{normalize_indent_after_first_line(setup_cmd)}\n')
             buf.write('\n')
 
         return buf.getvalue()
 
     def build(self) -> str:
+        comments = [
+            comment.rstrip()
+            for tool in self.tools.values()
+            for kind, comment, _ in tool.setup
+            if kind == 'comment'
+        ]
         stages = []
         for name, tool in self.tools.items():
             stages.append(self.build_tool_stage(name, tool))
         dockerfile = self.docker_template.substitute(tool_stages='\n'.join(stages))
-        if self.engine == 'docker' and any(
-            any(tool.setup_uses_build_device) for tool in self.tools.values()
-        ):
-            return '# syntax=docker/dockerfile:1-labs\n\n' + dockerfile
+        if comments:
+            return '\n\n'.join(comments) + '\n\n' + dockerfile
         return dockerfile
 
 
@@ -641,13 +650,13 @@ class ImageBuilder:
         dockerfile_path: pathlib.Path,
         arch: str | None = None,
         copies: list[dict[str, str]] | None = None,
-        build_device_steps: list[tuple[list[str], str]] | None = None,
+        build_args: list[str] | None = None,
     ) -> None:
         self.name = name
         self.dockerfile_path = dockerfile_path
         self.arch = arch
         self.copies = copies or []
-        self.build_device_steps = build_device_steps or []
+        self.build_args = build_args or []
         self.engine: str | None = None
 
     @staticmethod
@@ -690,23 +699,8 @@ class ImageBuilder:
         logger.info(f'building image: {self.name}')
 
         self.engine = ContainerEngine.engine()
-        if self.build_device_steps and self.engine not in {'docker', 'podman'}:
-            logger.error(f'build-time devices are not supported with {self.engine}')
-            return False
-
         build_cmd = ContainerEngine.cmd('build')
-        if self.build_device_steps and self.engine == 'docker':
-            devices = dict.fromkeys(
-                device for step_devices, _ in self.build_device_steps for device in step_devices
-            )
-            for device in devices:
-                build_cmd.extend(['--allow', f'device={device}'])
-        elif self.build_device_steps and self.engine == 'podman':
-            devices = dict.fromkeys(
-                device for step_devices, _ in self.build_device_steps for device in step_devices
-            )
-            for device in devices:
-                build_cmd.extend(['--device', device])
+        build_cmd.extend(self.build_args)
         build_cmd.extend(['-t', self.name, '-f', str(self.dockerfile_path)])
 
         if self.arch:
@@ -714,13 +708,8 @@ class ImageBuilder:
 
         if logger.isEnabledFor(logging.DEBUG):
             build_cmd.append('--progress=plain')
-            if not self.build_device_steps:
+            if '--no-cache' not in build_cmd:
                 build_cmd.append('--no-cache')
-
-        if self.build_device_steps:
-            # The llama installer selects a binary from the visible GPU; don't reuse
-            # a cached result that may have been selected on a different build host.
-            build_cmd.append('--no-cache')
 
         build_cmd.append(str(CONTEXT_DIR))
         logger.debug(f'running: {" ".join(build_cmd)}')
@@ -783,6 +772,14 @@ class DevContainerManager:
 
     @staticmethod
     def start(image_name: str, name: str | None, docker_config: dict[str, typing.Any], arch: str | None = None) -> None:
+        run_args = [
+            *docker_config.get('run_args', []),
+            *docker_config.get('engine_run_args', {}).get(ContainerEngine.engine(), []),
+        ]
+        if any(arg == '--rm' or arg.startswith('--rm=') for arg in run_args):
+            logger.error("run-args must not include '--rm'; dnv manages container lifecycle")
+            sys.exit(1)
+
         cmd = ContainerEngine.cmd('run', '-it', '--label', 'devenv=true')
 
         # Add platform flag if cross-platform run is needed
@@ -801,7 +798,7 @@ class DevContainerManager:
             mode = volume.get('mode', 'rw')
             cmd.extend(['-v', f'{source}:{target}:{mode}'])
 
-        cmd.extend(docker_config.get('run_args', []))
+        cmd.extend(run_args)
 
         cmd.append(image_name)
         cmd.append('bash')
@@ -935,7 +932,9 @@ class CommandHandler:
             dockerfile_path,
             config.host_arch,
             copies=config.copies(),
-            build_device_steps=config.build_device_steps(),
+            build_args=_profile_engine_args(
+                config.get_profile_data(), 'build_args', ContainerEngine.engine()
+            ),
         )
 
         if self.args.rebuild:
@@ -973,7 +972,9 @@ class CommandHandler:
             dockerfile_path,
             config.host_arch,
             copies=config.copies(),
-            build_device_steps=config.build_device_steps(),
+            build_args=_profile_engine_args(
+                config.get_profile_data(), 'build_args', ContainerEngine.engine()
+            ),
         )
         if not image_builder.build():
             logger.error('failed to build image')
