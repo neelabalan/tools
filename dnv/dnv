@@ -19,6 +19,7 @@ import shutil
 import string
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 import typing
@@ -195,7 +196,7 @@ def load_config(path: pathlib.Path) -> Config:
     )
 
 
-def resolve_dependencies(tools: dict[str, Tool], selected: list[str]) -> list[str]:
+def resolve_dependencies(tools: dict[str, Tool | ToolSpec], selected: list[str]) -> list[str]:
     resolved: list[str] = []
     visited: set[str] = set()
     in_stack: set[str] = set()
@@ -395,6 +396,101 @@ class DevEnvironmentConfig:
                 raise ValueError(f'unknown install step: {kind}')
 
 
+class HostPackageInstaller:
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self.host_arch = get_host_architecture()
+        self.system = platform.system().lower()
+        if self.system not in {'darwin', 'linux'}:
+            raise ValueError(f'unsupported host operating system: {platform.system()}')
+        self.effective_arch = f'darwin-{self.host_arch}' if self.system == 'darwin' else self.host_arch
+
+    def _resolve(self, selected: list[str]) -> list[tuple[str, ToolSpec, list[str]]]:
+        names = resolve_dependencies(self.config.tools, selected)
+        resolved: list[tuple[str, ToolSpec, list[str]]] = []
+
+        for name in names:
+            spec = self.config.tools[name]
+            arch = spec.arch_map.get(self.effective_arch, '')
+            if spec.arch_map and not arch:
+                raise ValueError(
+                    f'package {name!r} has no artifact for {self.effective_arch}; '
+                    f'available: {list(spec.arch_map)}'
+                )
+            if spec.copy:
+                raise ValueError(
+                    f'package {name!r} uses container file copies and cannot be installed directly on the host'
+                )
+
+            commands: list[str] = []
+            for kind, value in spec.install:
+                if kind == 'script':
+                    raise ValueError(
+                        f'package {name!r} uses a distro-specific script and cannot be installed '
+                        'directly on the host'
+                    )
+                if '$profile' in value or '${profile}' in value:
+                    raise ValueError(
+                        f'package {name!r} requires a profile; profile-based installs are not '
+                        'supported by `dnv install`'
+                    )
+                if kind not in {'run', 'run-with-build-device'}:
+                    raise ValueError(f'package {name!r} has unknown install step: {kind}')
+                commands.append(
+                    string.Template(value).safe_substitute(version=spec.version, arch=arch)
+                )
+
+            resolved.append((name, spec, commands))
+
+        return resolved
+
+    @staticmethod
+    def _install_environment() -> dict[str, str]:
+        env = os.environ.copy()
+        env.setdefault('HOME', str(pathlib.Path.home()))
+        home = pathlib.Path(env['HOME'])
+        path_entries = [str(home / '.local' / 'bin'), str(home / '.cargo' / 'bin')]
+        current_path = env.get('PATH', '')
+        env['PATH'] = os.pathsep.join([*path_entries, current_path])
+        return env
+
+    def install(self, selected: list[str], dry_run: bool = False) -> bool:
+        packages = self._resolve(selected)
+        env = self._install_environment()
+
+        if dry_run:
+            logger.info('host: %s / %s', self.system, self.host_arch)
+            logger.info('install order: %s', ' -> '.join(name for name, _, _ in packages))
+        else:
+            (pathlib.Path(env['HOME']) / '.local' / 'bin').mkdir(parents=True, exist_ok=True)
+
+        with tempfile.TemporaryDirectory(prefix='dnv-install-') as temp_dir:
+            for name, spec, commands in packages:
+                logger.info('%s %s...', 'would install' if dry_run else 'installing', name)
+
+                for env_item in spec.env:
+                    for key, value in env_item.items():
+                        env[key] = string.Template(value).safe_substitute(env)
+
+                for command in commands:
+                    if dry_run:
+                        logger.info('  %s', command)
+                        continue
+                    result = subprocess.run(
+                        ['/bin/bash', '-euo', 'pipefail', '-c', command],
+                        cwd=temp_dir,
+                        env=env,
+                    )
+                    if result.returncode != 0:
+                        logger.error('install step failed for %s (exit status %s)', name, result.returncode)
+                        return False
+
+                if not dry_run:
+                    logger.info('%s installed', name)
+
+        return True
+
+
 def normalize_indent_after_first_line(s: str, indent: int = 4) -> str:
     lines = s.splitlines()
     if not lines:
@@ -505,159 +601,6 @@ class DockerfileBuilder:
         ):
             return '# syntax=docker/dockerfile:1-labs\n\n' + dockerfile
         return dockerfile
-
-
-class SetupShBuilder:
-    def _get_header(self, profile: str, distro: str, arch: str) -> str:
-        return textwrap.dedent(f"""
-            #!/bin/bash
-            set -euo pipefail
-
-            # generated setup script for profile: {profile}
-            # distro: {distro}, arch: {arch}
-
-            RED='\\033[0;31m'
-            GREEN='\\033[0;32m'
-            YELLOW='\\033[0;33m'
-            NC='\\033[0m'
-
-            log_info() {{ echo -e "${{GREEN}}[info]${{NC}} $1"; }}
-            log_warn() {{ echo -e "${{YELLOW}}[warn]${{NC}} $1"; }}
-            log_error() {{ echo -e "${{RED}}[error]${{NC}} $1" >&2; }}
-
-            # ensure local bin directory exists
-            mkdir -p "$HOME/.local/bin"
-            export PATH="$HOME/.local/bin:$PATH"
-
-            # use temp directory for downloads
-            TMPDIR=$(mktemp -d)
-            trap "rm -rf $TMPDIR" EXIT
-            cd "$TMPDIR"
-
-            TOOLS_TO_INSTALL=()
-            INSTALL_ALL=false
-        """)
-
-    SETUP_SH_MAIN = textwrap.dedent("""
-        print_usage() {
-            echo "usage: $0 [options] [tool1 tool2 ...]"
-            echo ""
-            echo "options:"
-            echo "  --all        install all tools"
-            echo "  --list       list available tools"
-            echo "  --help       show this help"
-            echo ""
-            echo "available tools:"
-            for tool in "${!TOOL_FUNCTIONS[@]}"; do
-                echo "  $tool"
-            done | sort
-        }
-
-        while [[ $# -gt 0 ]]; do
-            case "$1" in
-                --all)
-                    INSTALL_ALL=true
-                    shift
-                    ;;
-                --list)
-                    echo "available tools:"
-                    for tool in "${!TOOL_FUNCTIONS[@]}"; do
-                        echo "  $tool"
-                    done | sort
-                    exit 0
-                    ;;
-                --help|-h)
-                    print_usage
-                    exit 0
-                    ;;
-                -*)
-                    log_error "unknown option: $1"
-                    print_usage
-                    exit 1
-                    ;;
-                *)
-                    TOOLS_TO_INSTALL+=("$1")
-                    shift
-                    ;;
-            esac
-        done
-
-        if [[ "$INSTALL_ALL" == true ]]; then
-            TOOLS_TO_INSTALL=("${ALL_TOOLS[@]}")
-        fi
-
-        if [[ ${#TOOLS_TO_INSTALL[@]} -eq 0 ]]; then
-            print_usage
-            exit 1
-        fi
-
-        log_info "installing base packages..."
-        eval "$BASE_INSTALL"
-
-        for tool in "${TOOLS_TO_INSTALL[@]}"; do
-            if [[ -n "${TOOL_FUNCTIONS[$tool]:-}" ]]; then
-                log_info "installing $tool..."
-                eval "${TOOL_FUNCTIONS[$tool]}"
-                log_info "$tool installed"
-            else
-                log_error "unknown tool: $tool"
-                exit 1
-            fi
-        done
-
-        log_info "setup complete!"
-    """)
-
-    def __init__(self, config: DevEnvironmentConfig) -> None:
-        self.config = config
-        self.tools = config.conf
-
-    def _escape_for_bash(self, cmd: str) -> str:
-        # escape single quotes for embedding in bash single-quoted string
-        return cmd.replace("'", "'\"'\"'")
-
-    def build_tool_entry(self, name: str, tool: Tool) -> str:
-        commands = []
-        for copy_item in tool.copy:
-            destination = f'"$HOME/{copy_item["destination"]}"'
-            commands.append(f'mkdir -p "$(dirname {destination})"')
-            commands.append(f'cp {shlex.quote(str(pathlib.Path(copy_item["source"]).expanduser()))} {destination}')
-        commands.extend(tool.setup)
-
-        if not commands:
-            commands = ['true']
-
-        combined = ' && '.join(commands)
-        escaped = self._escape_for_bash(combined)
-        return f"[{name}]='{escaped}'"
-
-    def build(self) -> str:
-        buf = io.StringIO()
-
-        # header
-        header = self._get_header(
-            profile=self.config.profile or 'unknown',
-            distro=self.config.distro,
-            arch=self.config.host_arch,
-        )
-        buf.write(header)
-
-        base_install = self.config.current_distro_config.install(*self.config.current_distro_config.base_packages())
-        buf.write(f'\nBASE_INSTALL={shlex.quote(base_install)}\n')
-
-        # tool functions as associative array
-        buf.write('\ndeclare -A TOOL_FUNCTIONS\n')
-        for name, tool in self.tools.items():
-            buf.write(f'TOOL_FUNCTIONS{self.build_tool_entry(name, tool)}\n')
-
-        # all tools array (preserves order)
-        tool_names = ' '.join(f'"{name}"' for name in self.tools.keys())
-        buf.write(f'\nALL_TOOLS=({tool_names})\n')
-
-        # main script
-        buf.write(self.SETUP_SH_MAIN)
-
-        return buf.getvalue()
 
 
 class ArtifactRepository:
@@ -1044,23 +987,25 @@ class CommandHandler:
             sys.exit(1)
 
         config = DevEnvironmentConfig.from_profile(self.args.profile)
+        if not config.current_distro_config.base_image:
+            logger.error(f'distro {config.distro} has no base-image; `craft` only generates Dockerfiles')
+            sys.exit(1)
 
-        # determine output format
-        output_format = self.args.format or ('dockerfile' if config.current_distro_config.base_image else 'shell')
+        dockerfile_content = DockerfileBuilder(config).build()
+        filename = f'Dockerfile.{config.profile}.{config.distro}.{config.host_arch}'
+        saved_path = self.artifact_repo.save_artifact(dockerfile_content, filename)
+        logger.info(f'Dockerfile written to: {saved_path}')
 
-        if output_format == 'shell':
-            script_content = SetupShBuilder(config).build()
-            filename = f'setup.{config.profile}.{config.distro}.{config.host_arch}.sh'
-            saved_path = self.artifact_repo.save_artifact(script_content, filename)
-            logger.info(f'setup script written to: {saved_path}')
-        else:
-            if not config.current_distro_config.base_image:
-                logger.error(f'distro {config.distro} has no base-image, use --format shell')
-                sys.exit(1)
-            dockerfile_content = DockerfileBuilder(config).build()
-            filename = f'Dockerfile.{config.profile}.{config.distro}.{config.host_arch}'
-            saved_path = self.artifact_repo.save_artifact(dockerfile_content, filename)
-            logger.info(f'Dockerfile written to: {saved_path}')
+    def handle_install(self) -> None:
+        try:
+            installer = HostPackageInstaller(load_config(self.args.config))
+            success = installer.install(self.args.packages, dry_run=self.args.dry_run)
+        except (OSError, ValueError) as e:
+            logger.error(str(e))
+            sys.exit(1)
+
+        if not success:
+            sys.exit(1)
 
     def handle_ls(self) -> None:
         DevContainerManager.list_deployments()
@@ -1101,6 +1046,8 @@ class CommandHandler:
 
     def handle(self) -> None:
         match self.args.command:
+            case 'install':
+                self.handle_install()
             case 'build':
                 self.handle_build()
             case 'spin':
@@ -1122,14 +1069,17 @@ def main() -> None:
         description='Development environment manager using containers',
         epilog="""
 Commands:
+  install   Install one or more configured packages on this host
   spin      Build (if needed) and start an interactive container from a profile
   build     Build container image from a profile without starting it
-  craft     Generate Dockerfile from a profile without building
+  craft     Generate a Dockerfile from a profile without building
   ls        List all devenv containers (running and stopped)
   rm        Remove one or more devenv containers
   shell     Open a shell in an existing container
 
 Examples:
+  %(prog)s install eza llama.cpp                      Install packages on this host
+  %(prog)s install --dry-run eza                      Preview packages and commands
   %(prog)s spin --profile python-minimal           Start minimal Python environment
   %(prog)s spin --profile workstation --name dev   Start with custom container name
   %(prog)s build --profile workstation             Build image without starting
@@ -1173,18 +1123,17 @@ Environment:
         help='profile name to use',
     )
 
+    # host package installation args
+    install_parser = subparsers.add_parser('install', help='install configured packages on this host')
+    install_parser.add_argument('packages', nargs='+', help='package name(s) from the config')
+    install_parser.add_argument('--dry-run', action='store_true', help='show install plan without running it')
+
     # craft command args
-    craft_parser = subparsers.add_parser('craft', help='generate Dockerfile or shell script')
+    craft_parser = subparsers.add_parser('craft', help='generate Dockerfile')
     craft_parser.add_argument(
         '--profile',
         required=True,
         help='profile name to use',
-    )
-    craft_parser.add_argument(
-        '--format',
-        choices=['dockerfile', 'shell'],
-        default=None,
-        help='output format: dockerfile or shell (default: dockerfile if the distro has a base-image, else shell)',
     )
 
     # ls command args

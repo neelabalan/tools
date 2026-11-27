@@ -58,14 +58,6 @@ distro "cuda" {
     }
 }
 
-distro "darwin" {
-    arch-prefix "darwin-"
-    update "true"
-    scripts {
-        clean "true"
-    }
-}
-
 // SECTION: packages  (tools: version, dependencies, arch artifacts, install steps)
 
 // package  tool: version, dependencies, per-arch artifact names, install steps
@@ -517,10 +509,4 @@ profile "ws-deb-arm" distro="debian" arch="aarch64" user="blue" {
     volume source="~/.ssh" target="/home/blue/.ssh" mode="ro"
     tools "python" "node" "rust" "go" "sdkman" "neovim" "starship" "fzf" "ripgrep" "tokei" "eza" \
         "kubectl" "ipython" "ranger" "ssh" "docker" "dotfiles"
-}
-
-profile "macos" distro="darwin" arch="aarch64" user="" {
-    tools "python" "node" "rust" "go" "sdkman" "neovim" "starship" "fzf" "ripgrep" "tokei" "eza" \
-        "bat" "fd" "btop" "age" "jq" "yq" "helm" "hurl" "zoxide" "yazi" "typst" "tree-sitter" \
-        "kubectl" "ipython" "ranger" "dotfiles"
 }
