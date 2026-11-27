@@ -1,0 +1,520 @@
+// dnv config: distros, packages and profiles for the dnv tool
+
+// SECTION: distros  (base images, package managers, distro scripts)
+
+// distros: base image, package manager, package-name overrides, and distro scripts
+//
+// base-image  image used for the Dockerfile
+// arch-prefix prefix added to the host arch when looking up `arch` entries in the packages section
+// install     package install command (sudo prefix is dropped in the Dockerfile)
+// flags       extra flags appended to install
+// update      package update command used in the Dockerfile
+// packages    packages installed on every image before any tool
+// scripts     shell snippets referenced by `script` install steps
+
+distro "debian" {
+    base-image "debian:bookworm"
+    install "sudo apt install -y"
+    update "apt update && apt upgrade -y"
+    packages "curl" "tar" "unzip" "zip" "git" "make" "build-essential" "vim" "procps" "iproute2" "openssh-server"
+    scripts {
+        clean "sudo apt-get clean && sudo rm -rf /var/lib/apt/lists/*"
+        mirror #"echo "Acquire::Retries \"3\";" > /etc/apt/apt.conf.d/80-retries"#
+    }
+}
+
+distro "alma" {
+    base-image "almalinux:9"
+    install "sudo dnf install -y"
+    flags "--skip-broken"
+    update "dnf update -y"
+    packages "curl" "tar" "unzip" "zip" "git" "make" "gcc" "vim" "procps" "iproute" "openssh-server"
+    scripts {
+        clean "dnf clean all"
+        mirror #"echo "fastestmirror=True" >> /etc/dnf/dnf.conf && echo "max_parallel_downloads=10" >> /etc/dnf/dnf.conf"#
+    }
+}
+
+distro "alma-minimal" {
+    base-image "almalinux:9-minimal"
+    install "sudo microdnf install -y"
+    update "microdnf update -y"
+    packages "tar" "unzip" "zip" "git" "make" "gcc" "vim" "procps" "iproute" "openssh-server"
+    scripts {
+        clean "dnf clean all"
+        mirror "true"
+    }
+}
+
+distro "cuda" {
+    base-image "nvidia/cuda:11.8.0-runtime-ubi8"
+    install "sudo dnf install -y"
+    flags "--skip-broken"
+    update "dnf update -y"
+    packages "curl" "tar" "unzip" "zip" "git" "make" "gcc" "vim" "procps" "iproute" "openssh-server"
+    scripts {
+        clean "dnf clean all"
+        mirror #"echo "fastestmirror=True" >> /etc/dnf/dnf.conf && echo "max_parallel_downloads=10" >> /etc/dnf/dnf.conf"#
+    }
+}
+
+// SECTION: packages  (tools: version, dependencies, arch artifacts, install steps)
+
+// package  tool: version, dependencies, per-arch artifact names, install steps
+//
+// install steps:
+//   script "name"  distro script (clean)
+//   run "cmd"      shell command; $version, $arch (from the arch map) and $profile are filled in
+//     with-args    optional Dockerfile RUN arguments (ignored by Podman and host installs)
+
+package "ranger" {
+    requires "python"
+    install {
+        run "uv tool install ranger-fm"
+    }
+}
+
+package "uv" version="0.7.9" {
+    env "PATH" "$HOME/.local/bin:$PATH"
+    install {
+        run "curl -LsSf https://astral.sh/uv/$version/install.sh | sh"
+    }
+}
+
+package "python" version="3.13" {
+    requires "uv"
+    install {
+        run "uv python install $version"
+    }
+}
+
+package "nvm" version="v0.39.2" {
+    install {
+        run "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/$version/install.sh | bash"
+    }
+}
+
+package "node" version="22" {
+    requires "nvm"
+    install {
+        run #"""
+            export NVM_DIR=$HOME/.nvm && \
+            source $NVM_DIR/nvm.sh && nvm install $version
+            """#
+    }
+}
+
+package "rust" {
+    env "PATH" "$PATH:$HOME/.cargo/bin"
+    install {
+        run "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash -s -- -y --no-modify-path"
+    }
+}
+
+package "go" version="go1.23.9" {
+    arch "x86_64" "linux-amd64"
+    arch "aarch64" "linux-arm64"
+    arch "darwin-aarch64" "darwin-arm64"
+    env "PATH" "$PATH:/usr/local/go/bin"
+    install {
+        run #"""
+            curl -LO https://go.dev/dl/$version.$arch.tar.gz && \
+            sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf $version.$arch.tar.gz && \
+            rm $version.$arch.tar.gz && \
+            echo 'export PATH=$PATH:/usr/local/go/bin' >> $HOME/.bashrc
+            """#
+    }
+}
+
+package "sdkman" {
+    install {
+        run "curl -s \"https://get.sdkman.io\" | bash"
+    }
+}
+
+package "pnpm" version="9.15.9" {
+    requires "node"
+    install {
+        run "curl -fsSL https://get.pnpm.io/install.sh | env PNPM_VERSION=$version sh -"
+    }
+}
+
+package "ipython" {
+    requires "python"
+    install {
+        run "uv tool install --python 3.13 ipython"
+    }
+}
+
+package "neovim" version="0.11.0" {
+    requires "dotfiles"
+    arch "x86_64" "linux-x86_64"
+    arch "aarch64" "linux-arm64"
+    arch "darwin-aarch64" "macos-arm64"
+    install {
+        run #"""
+            curl -LO https://github.com/neovim/neovim/releases/download/v$version/nvim-$arch.tar.gz && \
+            mkdir -p $HOME/.local/nvim && tar -C $HOME/.local/nvim -xzf nvim-$arch.tar.gz --strip-components=1 && \
+            ln -sf $HOME/.local/nvim/bin/nvim $HOME/.local/bin/nvim && \
+            rm nvim-$arch.tar.gz
+            """#
+        run "nvim --headless \"+Lazy! sync\" +qa"
+    }
+}
+
+package "starship" {
+    install {
+        run "curl -sS https://starship.rs/install.sh | sh -s -- -y && mkdir -p $HOME/.config"
+    }
+}
+
+package "fzf" version="0.56.3" {
+    arch "x86_64" "linux_amd64"
+    arch "aarch64" "linux_arm64"
+    arch "darwin-aarch64" "darwin_arm64"
+    install {
+        run #"""
+            curl -LO https://github.com/junegunn/fzf/releases/download/v$version/fzf-$version-$arch.tar.gz && \
+            tar -xzf fzf-$version-$arch.tar.gz && \
+            mv fzf $HOME/.local/bin/ && rm fzf-$version-$arch.tar.gz
+            """#
+    }
+}
+
+package "ripgrep" version="14.1.1" {
+    arch "x86_64" "x86_64-unknown-linux-musl"
+    arch "aarch64" "aarch64-unknown-linux-gnu"
+    arch "darwin-aarch64" "aarch64-apple-darwin"
+    install {
+        run #"""
+            curl -LO https://github.com/BurntSushi/ripgrep/releases/download/$version/ripgrep-$version-$arch.tar.gz && \
+            tar -xzf ripgrep-$version-$arch.tar.gz && \
+            mv ripgrep-$version-$arch/rg $HOME/.local/bin/ && \
+            rm -rf ripgrep-$version-$arch*
+            """#
+    }
+}
+
+package "tokei" version="12.1.2" {
+    requires "rust"
+    arch "x86_64" "x86_64"
+    arch "aarch64" "aarch64"
+    arch "darwin-aarch64" "aarch64"
+    install {
+        run "cargo install tokei --version $version --locked"
+    }
+}
+
+package "eza" version="0.21.1" {
+    requires "rust"
+    arch "x86_64" "x86_64"
+    arch "aarch64" "aarch64"
+    arch "darwin-aarch64" "aarch64"
+    install {
+        run "cargo install eza --version $version --locked"
+    }
+}
+
+package "bat" version="0.24.0" {
+    arch "x86_64" "x86_64-unknown-linux-musl"
+    arch "aarch64" "aarch64-unknown-linux-gnu"
+    arch "darwin-aarch64" "aarch64-apple-darwin"
+    install {
+        run #"""
+            curl -LO https://github.com/sharkdp/bat/releases/download/v$version/bat-v$version-$arch.tar.gz && \
+            tar -xzf bat-v$version-$arch.tar.gz && \
+            mv bat-v$version-$arch/bat $HOME/.local/bin/ && \
+            rm -rf bat-v$version-$arch*
+            """#
+    }
+}
+
+package "fd" version="10.2.0" {
+    arch "x86_64" "x86_64-unknown-linux-musl"
+    arch "aarch64" "aarch64-unknown-linux-gnu"
+    arch "darwin-aarch64" "aarch64-apple-darwin"
+    install {
+        run #"""
+            curl -LO https://github.com/sharkdp/fd/releases/download/v$version/fd-v$version-$arch.tar.gz && \
+            tar -xzf fd-v$version-$arch.tar.gz && \
+            mv fd-v$version-$arch/fd $HOME/.local/bin/ && \
+            rm -rf fd-v$version-$arch*
+            """#
+    }
+}
+
+package "btop" version="1.4.0" {
+    arch "x86_64" "x86_64-linux-musl"
+    arch "aarch64" "aarch64-linux-musl"
+    arch "darwin-aarch64" "aarch64-macos"
+    install {
+        run #"""
+            curl -LO https://github.com/aristocratos/btop/releases/download/v$version/btop-$arch.tbz && \
+            tar -xjf btop-$arch.tbz && \
+            mv btop/bin/btop $HOME/.local/bin/ && \
+            rm -rf btop btop-$arch.tbz
+            """#
+    }
+}
+
+package "age" version="1.2.0" {
+    arch "x86_64" "linux-amd64"
+    arch "aarch64" "linux-arm64"
+    arch "darwin-aarch64" "darwin-arm64"
+    install {
+        run #"""
+            curl -LO https://github.com/FiloSottile/age/releases/download/v$version/age-v$version-$arch.tar.gz && \
+            tar -xzf age-v$version-$arch.tar.gz && \
+            mv age/age age/age-keygen $HOME/.local/bin/ && \
+            rm -rf age age-v$version-$arch.tar.gz
+            """#
+    }
+}
+
+package "jq" version="1.7.1" {
+    arch "x86_64" "linux-amd64"
+    arch "aarch64" "linux-arm64"
+    arch "darwin-aarch64" "macos-arm64"
+    install {
+        run #"""
+            curl -LO https://github.com/jqlang/jq/releases/download/jq-$version/jq-$arch && \
+            chmod +x jq-$arch && mv jq-$arch $HOME/.local/bin/jq
+            """#
+    }
+}
+
+package "yq" version="4.44.3" {
+    arch "x86_64" "linux_amd64"
+    arch "aarch64" "linux_arm64"
+    arch "darwin-aarch64" "darwin_arm64"
+    install {
+        run #"""
+            curl -LO https://github.com/mikefarah/yq/releases/download/v$version/yq_$arch && \
+            chmod +x yq_$arch && mv yq_$arch $HOME/.local/bin/yq
+            """#
+    }
+}
+
+package "helm" version="3.16.3" {
+    arch "x86_64" "linux-amd64"
+    arch "aarch64" "linux-arm64"
+    arch "darwin-aarch64" "darwin-arm64"
+    install {
+        run #"""
+            curl -LO https://get.helm.sh/helm-v$version-$arch.tar.gz && \
+            tar -xzf helm-v$version-$arch.tar.gz && \
+            mv $arch/helm $HOME/.local/bin/ && \
+            rm -rf $arch helm-v$version-$arch.tar.gz
+            """#
+    }
+}
+
+package "hurl" version="5.0.1" {
+    arch "x86_64" "x86_64-unknown-linux-gnu"
+    arch "aarch64" "aarch64-unknown-linux-gnu"
+    arch "darwin-aarch64" "aarch64-apple-darwin"
+    install {
+        run #"""
+            curl -LO https://github.com/Orange-OpenSource/hurl/releases/download/$version/hurl-$version-$arch.tar.gz && \
+            tar -xzf hurl-$version-$arch.tar.gz && \
+            mv hurl-$version-$arch/bin/hurl $HOME/.local/bin/ && \
+            rm -rf hurl-$version-$arch*
+            """#
+    }
+}
+
+package "zoxide" version="0.9.6" {
+    arch "x86_64" "x86_64-unknown-linux-musl"
+    arch "aarch64" "aarch64-unknown-linux-musl"
+    arch "darwin-aarch64" "aarch64-apple-darwin"
+    install {
+        run #"""
+            curl -LO https://github.com/ajeetdsouza/zoxide/releases/download/v$version/zoxide-$version-$arch.tar.gz && \
+            tar -xzf zoxide-$version-$arch.tar.gz && \
+            mv zoxide $HOME/.local/bin/ && \
+            rm zoxide-$version-$arch.tar.gz
+            """#
+    }
+}
+
+package "yazi" version="0.4.2" {
+    arch "x86_64" "x86_64-unknown-linux-musl"
+    arch "aarch64" "aarch64-unknown-linux-musl"
+    arch "darwin-aarch64" "aarch64-apple-darwin"
+    install {
+        run #"""
+            curl -LO https://github.com/sxyazi/yazi/releases/download/v$version/yazi-$arch.zip && \
+            unzip -o yazi-$arch.zip && \
+            mv yazi-$arch/yazi $HOME/.local/bin/ && \
+            rm -rf yazi-$arch*
+            """#
+    }
+}
+
+package "typst" version="0.12.0" {
+    arch "x86_64" "x86_64-unknown-linux-musl"
+    arch "aarch64" "aarch64-unknown-linux-musl"
+    arch "darwin-aarch64" "aarch64-apple-darwin"
+    install {
+        run #"""
+            curl -LO https://github.com/typst/typst/releases/download/v$version/typst-$arch.tar.xz && \
+            tar -xJf typst-$arch.tar.xz && \
+            mv typst-$arch/typst $HOME/.local/bin/ && \
+            rm -rf typst-$arch*
+            """#
+    }
+}
+
+package "tree-sitter" version="0.24.5" {
+    arch "x86_64" "linux-x64"
+    arch "aarch64" "linux-arm64"
+    arch "darwin-aarch64" "macos-arm64"
+    install {
+        run #"""
+            curl -LO https://github.com/tree-sitter/tree-sitter/releases/download/v$version/tree-sitter-$arch.gz && \
+            gunzip tree-sitter-$arch.gz && \
+            chmod +x tree-sitter-$arch && \
+            mv tree-sitter-$arch $HOME/.local/bin/tree-sitter
+            """#
+    }
+}
+
+package "kubectl" version="v1.33.1" {
+    arch "x86_64" "linux/amd64"
+    arch "aarch64" "linux/arm64"
+    arch "darwin-aarch64" "darwin/arm64"
+    install {
+        run #"""
+            curl -LO https://dl.k8s.io/release/$version/bin/$arch/kubectl && \
+            chmod +x kubectl && mv kubectl $HOME/.local/bin/kubectl
+            """#
+    }
+}
+
+// WARNING: `copy` bakes the files below into the image layers. Anyone with the image
+// can extract the private key. This is an accepted risk for this package; do not
+// copy secrets into images you share or push to a registry.
+package "ssh" {
+    copy "~/.ssh/id_rsa" ".ssh/id_rsa"
+    copy "~/.ssh/known_hosts" ".ssh/known_hosts"
+    install {
+        run #"""
+            sudo sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+            sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
+            sudo sed -i 's/^#*UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config && \
+            sudo ssh-keygen -A
+            """#
+    }
+}
+
+package "docker" version="28.3.3" {
+    arch "x86_64" "x86_64"
+    arch "aarch64" "aarch64"
+    install {
+        run "mkdir -p $HOME/.local/bin && curl -fsSL https://download.docker.com/linux/static/stable/$arch/docker-$version.tgz | tar -xz --strip-components=1 -C $HOME/.local/bin docker/docker"
+    }
+}
+
+package "llama.cpp" {
+    install {
+        comment "# syntax=docker/dockerfile:1-labs\n\n"
+        run "curl -LsSf https://llama.app/install.sh | sh" with-args="--device=nvidia.com/gpu=all"
+    }
+}
+
+package "dotsync" version="0.0.4" {
+    arch "x86_64" "linux-x86_64"
+    arch "aarch64" "linux-aarch64"
+    arch "darwin-aarch64" "darwin-aarch64"
+    install {
+        run "curl -L https://github.com/neelabalan/tools/releases/download/dotsync-v$version/dotsync-$arch.tar.gz | tar xz"
+        run "mv dotsync $HOME/.local/bin/"
+    }
+}
+
+package "dotfiles" {
+    requires "dotsync" "ssh"
+    install {
+        run "curl -fsSL https://raw.githubusercontent.com/neelabalan/dotfiles/refs/heads/master/dotsync.json -o $HOME/dotsync.json"
+        run "dotsync init --config $HOME/dotsync.json"
+        run "dotsync setup --profile $profile"
+    }
+}
+
+package "cleanup" {
+    install {
+        script "clean"
+    }
+}
+
+// SECTION: profiles  (named environments built from distros and packages)
+
+// profiles: named environments built from the distros and packages above
+//
+// profile  distro, arch, user, ports, volumes, tools, run-args, build-args
+//   run-args       generic runtime args or engine-specific docker/podman args
+//   build-args     generic build args or engine-specific docker/podman args
+
+profile "just-dotfiles" distro="alma" arch="x86_64" user="blue"
+
+profile "workstation" distro="alma" arch="x86_64" user="blue" {
+    volume source="~/.ssh" target="/home/blue/.ssh" mode="ro"
+    tools "python" "node" "rust" "go" "sdkman" "neovim" "starship" "fzf" "ripgrep" "tokei" "eza" \
+        "kubectl" "ipython" "ranger" "ssh" "docker" "dotfiles"
+}
+
+profile "workstation-gpu" distro="alma" arch="x86_64" user="blue" {
+    volume source="~/.ssh" target="/home/blue/.ssh" mode="ro"
+    build-args "--no-cache" {
+        docker "--allow" "device=nvidia.com/gpu=all"
+        podman "--device" "nvidia.com/gpu=all"
+    }
+    run-args {
+        docker "--gpus" "all"
+        podman "--device" "nvidia.com/gpu=all" "--security-opt=label=disable"
+    }
+    tools "python" "node" "rust" "go" "sdkman" "neovim" "starship" "fzf" "ripgrep" "tokei" "eza" \
+        "kubectl" "ipython" "ranger" "ssh" "docker" "dotfiles" "llama.cpp"
+}
+
+profile "workstation-arm" distro="alma" arch="aarch64" user="blue" {
+    volume source="~/.ssh" target="/home/blue/.ssh" mode="ro"
+    tools "python" "node" "rust" "go" "sdkman" "neovim" "starship" "fzf" "ripgrep" "tokei" "eza" \
+        "kubectl" "ipython" "ranger" "ssh" "docker" "dotfiles"
+}
+
+profile "python-minimal" distro="alma" arch="x86_64" user="blue" {
+    expose 8000
+    volume source="~/code" target="/home/blue/code" mode="rw"
+    tools "python" "fzf" "ripgrep" "ipython" "dotfiles"
+}
+
+profile "python-minimal-arm" distro="alma" arch="aarch64" user="blue" {
+    expose 8000
+    volume source="~/code" target="/home/blue/code" mode="rw"
+    tools "python" "fzf" "ripgrep" "ipython" "dotfiles"
+}
+
+profile "ml-cuda" distro="cuda" arch="x86_64" user="developer" {
+    working-directory "/home/developer/workspace"
+    volume source="./ml-workspace" target="/home/developer/workspace" mode="rw"
+    tools "python" "starship" "neovim" "dotfiles"
+}
+
+profile "workstation-minimal" distro="alma-minimal" arch="x86_64" user="blue" {
+    volume source="~/.ssh" target="/home/blue/.ssh" mode="ro"
+    tools "python" "rust" "go" "neovim" "starship" "fzf" "ripgrep" "eza" "ipython" "ranger" "ssh" \
+        "dotfiles"
+}
+
+profile "ws-deb" distro="debian" arch="x86_64" user="blue" {
+    volume source="~/.ssh" target="/home/blue/.ssh" mode="ro"
+    tools "python" "node" "rust" "go" "sdkman" "neovim" "starship" "fzf" "ripgrep" "tokei" "eza" \
+        "kubectl" "ipython" "ranger" "ssh" "docker" "dotfiles"
+}
+
+profile "ws-deb-arm" distro="debian" arch="aarch64" user="blue" {
+    volume source="~/.ssh" target="/home/blue/.ssh" mode="ro"
+    tools "python" "node" "rust" "go" "sdkman" "neovim" "starship" "fzf" "ripgrep" "tokei" "eza" \
+        "kubectl" "ipython" "ranger" "ssh" "docker" "dotfiles"
+}
